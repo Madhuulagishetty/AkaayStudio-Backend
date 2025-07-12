@@ -29,6 +29,7 @@ app.use(cors({
   origin: [
     'http://localhost:3000', 
     'http://localhost:5173',
+    'http://localhost:5174', // Added your current frontend port
     'https://yourdomain.com', 
     'https://your-netlify-domain.netlify.app',
     'https://birthday-backend-tau.vercel.app'
@@ -272,7 +273,7 @@ app.get('/payment-callback', (req, res) => {
   const { razorpay_payment_id, razorpay_order_id, razorpay_signature, error } = req.query;
   
   // Get the frontend URL from environment or use default
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5174';
   
   if (error) {
     // Payment failed - redirect to packages with error
@@ -519,7 +520,7 @@ app.post('/payment-success', async (req, res) => {
           status: "success", 
           message: "Payment verified successfully",
           savedBooking,
-          redirect_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/thank-you?payment_id=${razorpay_payment_id}&order_id=${razorpay_order_id}`
+          redirect_url: `${process.env.FRONTEND_URL || 'http://localhost:5174'}/thank-you?payment_id=${razorpay_payment_id}&order_id=${razorpay_order_id}`
         });
       } else {
         res.status(404).json({ error: "Order not found" });
@@ -718,7 +719,7 @@ app.get("/check-payment-status/:orderId", async (req, res) => {
       });
     }
 
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5174';
 
     switch (orderDetails.status) {
       case "paid":
