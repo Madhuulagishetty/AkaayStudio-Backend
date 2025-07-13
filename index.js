@@ -19,7 +19,6 @@ const db = getFirestore(firebaseApp);
 const express = require("express");
 const Razorpay = require("razorpay");
 const cors = require("cors");
-const twilio = require("twilio");
 require("dotenv").config();
 
 const app = express();
@@ -32,13 +31,6 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Initialize Twilio
-const twilioClient = new twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
-
-// In-memory storage for order details (use Redis in production)
 const orderStore = new Map();
 
 const saveBookingToSheet = async (bookingData) => {
@@ -87,6 +79,7 @@ const saveBookingToSheet = async (bookingData) => {
             processed_date: currentDate,
             processed_time: currentTime,
             processed_timestamp: isoTimestamp,
+            order_id: bookingData.orderId
           },
         ],
       },
@@ -97,79 +90,10 @@ const saveBookingToSheet = async (bookingData) => {
       }
     );
 
+    console.log("Data saved to Google Sheets successfully");
     return response.data;
   } catch (error) {
     console.error("Error saving to sheet:", error);
-    throw error;
-  }
-};
-
-const sendWhatsAppReminder = async (params) => {
-  try {
-    const {
-      to,
-      date,
-      time,
-      bookingName,
-      people,
-      location,
-      slotType,
-      decorations,
-      extraDecorations,
-    } = params;
-
-    const formattedNumber = to.startsWith("+") ? to.slice(1) : to;
-
-    const message = `🎬 BOOKING CONFIRMATION 🎬
-
-Hello ${bookingName || "there"}!
-
-Your theater booking is confirmed!
-
-📅 Date: ${date}
-⏰ Time: ${time}
-👥 Guests: ${people || "(not specified)"}
-🏠 Venue: Mini Theater ${location || ""}
-🎫 Slot Type: ${slotType || "Standard"}
-${
-  decorations
-    ? `✨ *Decorations:* Yes${
-        extraDecorations ? `\n   Details: ${extraDecorations}` : ""
-      }`
-    : ""
-}
-
-Please remember:
-• Arrive 15 minutes early
-• Bring your AADHAAR card for verification
-• No smoking/drinking allowed inside
-• Maintain cleanliness in the theater
-
-For any questions, contact us at:
-📞 +91-9764535650
-
-Thank you for your booking! Enjoy your experience!`;
-
-    const instanceId = "mcrtdre2eh";
-    const authToken = "ajhunrv7ff0j7giapl9xuz9olt6uax";
-
-    const response = await axios.post(
-      `https://api.zaply.dev/v1/instance/${instanceId}/message/send`,
-      {
-        number: formattedNumber,
-        message,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
-        },
-      }
-    );
-
-    console.log("WhatsApp reminder sent successfully!");
-  } catch (error) {
-    console.error("Error sending WhatsApp reminder:", error);
     throw error;
   }
 };
@@ -219,7 +143,16 @@ const saveToFirebase = async (bookingData, paymentDetails) => {
   }
 };
 
-// Verify Razorpay webhook signature
+const verifyPaymentSignature = (order_id, payment_id, signature, secret) => {
+  const body = order_id + "|" + payment_id;
+  const expectedSignature = crypto
+    .createHmac("sha256", secret)
+    .update(body.toString())
+    .digest("hex");
+
+  return expectedSignature === signature;
+};
+
 const verifyWebhookSignature = (body, signature, secret) => {
   const expectedSignature = crypto
     .createHmac("sha256", secret)
@@ -236,7 +169,7 @@ app.post("/create-order", async (req, res) => {
   try {
     const { amount, bookingData } = req.body;
     const options = {
-      amount: amount * 100,
+      amount: amount * 100, // Convert to paise
       currency: "INR",
       receipt: "receipt_" + Date.now(),
       notes: {
@@ -256,6 +189,7 @@ app.post("/create-order", async (req, res) => {
       createdAt: new Date(),
     });
 
+    console.log("Order created:", order.id);
     res.json(order);
   } catch (error) {
     console.error("Error creating order:", error);
@@ -316,6 +250,7 @@ app.post(
           const bookingDataWithPayment = {
             ...orderDetails.bookingData,
             paymentId: paymentId,
+            orderId: orderId,
             advanceAmount: orderDetails.amount,
             remainingAmount:
               orderDetails.bookingData.totalAmount - orderDetails.amount,
@@ -331,23 +266,6 @@ app.post(
 
           // Save to Google Sheets
           await saveBookingToSheet(bookingDataWithPayment);
-
-          // Send WhatsApp confirmation
-          if (orderDetails.bookingData?.lastItem) {
-            await sendWhatsAppReminder({
-              to: `91${orderDetails.bookingData.whatsapp}`,
-              date: orderDetails.bookingData.date,
-              time: `${orderDetails.bookingData.lastItem.start} - ${orderDetails.bookingData.lastItem.end}`,
-              bookingName:
-                orderDetails.bookingData.bookingName ||
-                orderDetails.bookingData.NameUser,
-              people: orderDetails.bookingData.people,
-              location: orderDetails.bookingData.location || "",
-              slotType: orderDetails.bookingData.slotType,
-              decorations: orderDetails.bookingData.wantDecoration,
-              extraDecorations: orderDetails.bookingData.extraDecorations,
-            });
-          }
 
           // Store success data for status check
           orderDetails.savedBooking = savedBooking;
@@ -427,7 +345,7 @@ app.get("/check-payment-status/:orderId", async (req, res) => {
   }
 });
 
-// Legacy verify-payment endpoint for backward compatibility
+// Payment verification endpoint
 app.post("/verify-payment", async (req, res) => {
   try {
     const {
@@ -440,9 +358,24 @@ app.post("/verify-payment", async (req, res) => {
       amountWithTax,
     } = req.body;
 
-    // This endpoint is now mainly for manual verification
-    // Most processing should happen via webhook
+    // Verify payment signature
+    const isValidSignature = verifyPaymentSignature(
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      process.env.RAZORPAY_KEY_SECRET
+    );
 
+    if (!isValidSignature) {
+      return res.status(400).json({ 
+        status: "failed", 
+        message: "Invalid payment signature" 
+      });
+    }
+
+    console.log("Payment signature verified successfully");
+
+    // Check if already processed via webhook
     const orderDetails = orderStore.get(razorpay_order_id);
     if (orderDetails && orderDetails.status === "paid") {
       // Payment already processed via webhook
@@ -454,22 +387,35 @@ app.post("/verify-payment", async (req, res) => {
       return;
     }
 
-    // Fallback processing if webhook failed
+    // Process the payment
     const bookingDataWithPayment = {
       ...bookingData,
       paymentId: razorpay_payment_id,
+      orderId: razorpay_order_id,
       advanceAmount,
       remainingAmount,
       amountWithTax,
     };
 
+    // Save to Firebase
     const savedBooking = await saveToFirebase(bookingDataWithPayment, {
       razorpay_payment_id,
       razorpay_order_id,
       razorpay_signature,
     });
 
+    // Save to Google Sheets
     await saveBookingToSheet(bookingDataWithPayment);
+
+    // Update order store
+    if (orderDetails) {
+      orderDetails.status = "paid";
+      orderDetails.paymentId = razorpay_payment_id;
+      orderDetails.savedBooking = savedBooking;
+      orderStore.set(razorpay_order_id, orderDetails);
+    }
+
+    console.log("Payment verified and booking saved successfully");
 
     res.json({
       status: "success",
@@ -478,7 +424,10 @@ app.post("/verify-payment", async (req, res) => {
     });
   } catch (error) {
     console.error("Error verifying payment:", error);
-    res.status(500).json({ error: "Payment verification failed" });
+    res.status(500).json({ 
+      status: "failed", 
+      message: "Payment verification failed" 
+    });
   }
 });
 
@@ -490,74 +439,10 @@ setInterval(() => {
   for (const [orderId, orderDetails] of orderStore.entries()) {
     if (orderDetails.createdAt < cutoff) {
       orderStore.delete(orderId);
+      console.log("Cleaned up old order:", orderId);
     }
   }
 }, 60 * 60 * 1000); // Run every hour
-
-// New endpoint to send WhatsApp messages
-app.post("/send-whatsapp", async (req, res) => {
-  try {
-    const { to, date, time } = req.body;
-
-    if (!to || !date || !time) {
-      return res.status(400).json({
-        error:
-          "Missing required parameters. Please provide to, date, and time.",
-      });
-    }
-
-    const recipient = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
-
-    const message = await twilioClient.messages.create({
-      from: `${process.env.TWILIO_WHATSAPP_NUMBER}`,
-      to: recipient,
-      body: `Your birthday celebration booking is confirmed for ${date} at ${time}. We're excited to host you! If you need to make any changes, please contact us.`,
-    });
-
-    res.json({
-      success: true,
-      messageId: message.sid,
-      status: message.status,
-    });
-  } catch (error) {
-    console.error("Error sending WhatsApp message:", error);
-    res.status(500).json({
-      error: "Failed to send WhatsApp message",
-      details: error.message,
-    });
-  }
-});
-
-// Send reminder messages
-app.post("/send-reminder", async (req, res) => {
-  try {
-    const { to, date, time } = req.body;
-
-    if (!to || !date || !time) {
-      return res.status(400).json({ error: "Missing required parameters" });
-    }
-
-    const recipient = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
-
-    const message = await twilioClient.messages.create({
-      from: `${process.env.TWILIO_WHATSAPP_NUMBER}`,
-      to: recipient,
-      body: `Reminder: Your birthday celebration is tomorrow, ${date} at ${time}. We're looking forward to seeing you!`,
-    });
-
-    res.json({
-      success: true,
-      messageId: message.sid,
-      status: message.status,
-    });
-  } catch (error) {
-    console.error("Error sending reminder:", error);
-    res.status(500).json({
-      error: "Failed to send reminder",
-      details: error.message,
-    });
-  }
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
