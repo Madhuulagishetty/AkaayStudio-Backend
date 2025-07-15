@@ -112,6 +112,9 @@ const saveBookingToSheet = async (bookingData, retryCount = 0) => {
       source: bookingData.source || 'web_app',
       created_at: bookingData.createdAt || isoTimestamp,
       webhook_processed: true,
+      webhook_timestamp: isoTimestamp,
+      recovery_type: bookingData.minimal ? 'minimal' : bookingData.recovered ? 'recovered' : 'normal',
+      webhook_processed: true,
       webhook_timestamp: isoTimestamp
     };
 
@@ -185,10 +188,13 @@ const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
       source: bookingData.source || 'web_app',
       webhookProcessed: true,
       webhookTimestamp: new Date(),
+      recoveryType: bookingData.minimal ? 'minimal' : bookingData.recovered ? 'recovered' : 'normal',
+      webhookProcessed: true,
+      webhookTimestamp: new Date(),
       bookingMeta: {
         createdAt: new Date(),
         source: "web",
-        version: "3.0",
+        version: "3.1",
         paymentMethod: "razorpay_payment_link",
         webhookProcessed: true,
         processedAt: new Date().toISOString()
@@ -269,11 +275,12 @@ app.post("/create-payment-link", async (req, res) => {
       reminder_enable: false,
       callback_url: `${process.env.FRONTEND_URL || 'https://birthday-backend-tau.vercel.app'}/payment-success`,
       callback_method: "get",
-      // Store booking data in notes for recovery
+      // Store minimal data in notes (under 255 chars)
       notes: {
-        booking_data: JSON.stringify(bookingData),
-        reference_id: referenceId,
-        source: 'web_app'
+        ref_id: referenceId,
+        customer: bookingData.bookingName?.substring(0, 50) || 'Customer',
+        source: 'web_app',
+        amount: amount.toString()
       }
     };
 
@@ -482,31 +489,45 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
       try {
         const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkId);
         
-        if (paymentLinkDetails.notes && paymentLinkDetails.notes.booking_data) {
-          console.log(`✅ [${requestId}] Recovered booking data from Razorpay notes`);
+        if (paymentLinkDetails.notes && paymentLinkDetails.notes.ref_id) {
+          console.log(`🔍 [${requestId}] Found reference ID in notes: ${paymentLinkDetails.notes.ref_id}`);
           
-          const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.booking_data);
-          
-          // Create order details from recovered data
-          orderDetails = {
-            bookingData: {
-              ...recoveredBookingData,
-              totalAmount: recoveredBookingData.totalAmount || recoveredBookingData.amountWithTax,
-              advanceAmount: paymentLinkDetails.amount / 100,
-              remainingAmount: (recoveredBookingData.totalAmount || recoveredBookingData.amountWithTax) - (paymentLinkDetails.amount / 100),
-              source: 'webhook_recovery',
-              recoveredAt: new Date().toISOString()
-            },
-            amount: paymentLinkDetails.amount / 100,
-            status: "created",
-            type: "payment_link",
-            createdAt: new Date(),
-            reference_id: paymentLinkDetails.reference_id,
-            paymentLinkId: paymentLinkId,
-            recovered: true
-          };
+          // Try to find order by reference ID
+          const refOrderDetails = orderStore.get(paymentLinkDetails.notes.ref_id);
+          if (refOrderDetails) {
+            console.log(`✅ [${requestId}] Recovered order data using reference ID`);
+            orderDetails = refOrderDetails;
+            orderDetails.recovered = true;
+            orderDetails.recoveredAt = new Date().toISOString();
+          } else {
+            console.error(`❌ [${requestId}] Order not found even with reference ID: ${paymentLinkDetails.notes.ref_id}`);
+            
+            // Create minimal order details for basic processing
+            orderDetails = {
+              bookingData: {
+                bookingName: paymentLinkDetails.notes.customer || 'Customer',
+                totalAmount: paymentLinkDetails.amount / 100,
+                advanceAmount: paymentLinkDetails.amount / 100,
+                remainingAmount: 0,
+                source: 'minimal_recovery',
+                recoveredAt: new Date().toISOString(),
+                paymentLinkId: paymentLinkId,
+                reference_id: paymentLinkDetails.reference_id
+              },
+              amount: paymentLinkDetails.amount / 100,
+              status: "created",
+              type: "payment_link",
+              createdAt: new Date(),
+              reference_id: paymentLinkDetails.reference_id,
+              paymentLinkId: paymentLinkId,
+              recovered: true,
+              minimal: true
+            };
+            
+            console.log(`⚠️ [${requestId}] Created minimal order details for processing`);
+          }
         } else {
-          console.error(`❌ [${requestId}] No booking data found in payment link notes`);
+          console.error(`❌ [${requestId}] No reference ID found in payment link notes`);
           return;
         }
       } catch (recoveryError) {
@@ -821,15 +842,24 @@ app.post("/recover-payment", async (req, res) => {
         
         console.log(`🔄 Found payment to recover: ${payment.id}`);
         
-        // Process the payment manually with enhanced data
+        // Use provided booking data or create minimal data
+        const recoveryBookingData = bookingData || {
+          bookingName: paymentLink.notes?.customer || 'Customer',
+          totalAmount: paymentLink.amount / 100,
+          advanceAmount: paymentLink.amount / 100,
+          remainingAmount: 0,
+          source: 'recovery_minimal'
+        };
+        
+        // Process the payment manually with recovery data
         const bookingDataWithPayment = {
-          ...bookingData,
+          ...recoveryBookingData,
           paymentId: payment.id,
           orderId: payment.order_id,
           paymentLinkId: paymentLinkId,
-          advanceAmount: 10,
-          remainingAmount: bookingData.totalAmount - 10,
-          totalAmount: bookingData.totalAmount,
+          advanceAmount: paymentLink.amount / 100,
+          remainingAmount: Math.max(0, (recoveryBookingData.totalAmount || 0) - (paymentLink.amount / 100)),
+          totalAmount: recoveryBookingData.totalAmount || paymentLink.amount / 100,
           recoveredAt: new Date().toISOString(),
           source: 'manual_recovery'
         };
