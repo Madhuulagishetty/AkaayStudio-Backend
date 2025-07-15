@@ -42,7 +42,6 @@ app.use(cors({
 
 // Raw body parser for webhook
 app.use('/webhook', express.raw({ type: 'application/json' }));
-
 // JSON parser for other routes
 app.use(express.json({ limit: '10mb' }));
 
@@ -119,7 +118,7 @@ const saveBookingToSheet = async (bookingData) => {
         headers: {
           "Content-Type": "application/json",
         },
-        timeout: 1000, 
+        timeout: 15000, 
       }
     );
 
@@ -227,7 +226,7 @@ app.post("/create-payment-link", async (req, res) => {
         email: false,
       },
       reminder_enable: false,
-      callback_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/payment-success`,
+      callback_url: `${process.env.FRONTEND_URL || 'https://birthday-backend-tau.vercel.app'}/payment-success`,
       callback_method: "get",
     };
 
@@ -376,6 +375,46 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
     if (!orderDetails) {
       console.error(`❌ [${requestId}] Payment link data not found: ${paymentLinkEntity.id}`);
       console.log(`📋 [${requestId}] Available IDs:`, Array.from(orderStore.keys()));
+      
+      // Try to fetch payment details from Razorpay API as fallback
+      try {
+        console.log(`🔄 [${requestId}] Attempting to fetch payment link details from Razorpay...`);
+        const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkEntity.id);
+        
+        if (paymentLinkDetails && paymentLinkDetails.notes) {
+          console.log(`✅ [${requestId}] Recovered booking data from Razorpay notes`);
+          const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.bookingData || '{}');
+          
+          const bookingDataWithPayment = {
+            ...recoveredBookingData,
+            paymentId: paymentEntity.id,
+            orderId: paymentEntity.order_id,
+            paymentLinkId: paymentLinkEntity.id,
+            advanceAmount: paymentLinkDetails.amount / 100,
+            webhookProcessedAt: new Date().toISOString(),
+            webhookRequestId: requestId,
+            source: 'webhook_recovery'
+          };
+
+          const paymentDetails = {
+            razorpay_payment_id: paymentEntity.id,
+            razorpay_order_id: paymentEntity.order_id,
+            payment_link_id: paymentLinkEntity.id,
+          };
+
+          // Save recovered data
+          const [firebaseResult, sheetsResult] = await Promise.allSettled([
+            saveToFirebase(bookingDataWithPayment, paymentDetails),
+            saveBookingToSheet(bookingDataWithPayment)
+          ]);
+
+          console.log(`✅ [${requestId}] Recovery save completed - Firebase: ${firebaseResult.status}, Sheets: ${sheetsResult.status}`);
+          return;
+        }
+      } catch (recoveryError) {
+        console.error(`❌ [${requestId}] Recovery attempt failed:`, recoveryError.message);
+      }
+      
       return;
     }
     
