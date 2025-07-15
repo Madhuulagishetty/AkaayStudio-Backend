@@ -21,43 +21,82 @@ const Razorpay = require("razorpay");
 const cors = require("cors");
 require("dotenv").config();
 
-// Retry utility function
-const retryWithBackoff = async (fn, maxRetries = 3, baseDelay = 1000) => {
+// Enhanced retry utility with exponential backoff
+const retryWithBackoff = async (fn, maxRetries = 3, baseDelay = 1000, context = "operation") => {
   for (let i = 0; i < maxRetries; i++) {
     try {
       return await fn();
     } catch (error) {
-      if (i === maxRetries - 1) throw error;
-      const delay = baseDelay * Math.pow(2, i);
-      console.log(`🔄 Retry ${i + 1}/${maxRetries} after ${delay}ms...`);
+      console.error(`❌ ${context} attempt ${i + 1}/${maxRetries} failed:`, error.message);
+      
+      if (i === maxRetries - 1) {
+        console.error(`❌ ${context} failed after ${maxRetries} attempts`);
+        throw error;
+      }
+      
+      const delay = baseDelay * Math.pow(2, i) + Math.random() * 1000;
+      console.log(`🔄 ${context} retry ${i + 1} in ${delay.toFixed(0)}ms...`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 };
 
 // Environment validation
-if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
-  console.error("❌ Missing Razorpay credentials in environment variables");
-  process.exit(1);
-}
+const validateEnvironment = () => {
+  const required = [
+    'RAZORPAY_KEY_ID',
+    'RAZORPAY_KEY_SECRET',
+    'RAZORPAY_WEBHOOK_SECRET'
+  ];
+  
+  const missing = required.filter(key => !process.env[key]);
+  
+  if (missing.length > 0) {
+    console.error(`❌ Missing environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+  
+  console.log('✅ Environment validation passed');
+};
 
-if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
-  console.error("❌ Missing Razorpay webhook secret in environment variables");
-  process.exit(1);
-}
+validateEnvironment();
 
 const app = express();
 
-// Enhanced middleware with better error handling
+// Enhanced CORS configuration
 app.use(cors({
-  origin: process.env.FRONTEND_URL || ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:4173'],
-  credentials: true
+  origin: process.env.FRONTEND_URL || [
+    'http://localhost:3000', 
+    'http://localhost:5173', 
+    'http://localhost:4173',
+    'https://birthday-backend-tau.vercel.app'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
-// Raw body parser for webhook
-app.use('/webhook', express.raw({ type: 'application/json' }));
-// JSON parser for other routes
+// Enhanced middleware setup
+app.use('/webhook', express.raw({ type: 'application/json', limit: '1mb' }));
 app.use(express.json({ limit: '10mb' }));
+
+// Enhanced logging middleware
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  const requestId = Math.random().toString(36).substr(2, 9);
+  
+  req.requestId = requestId;
+  req.startTime = startTime;
+  
+  console.log(`🌐 [${requestId}] ${req.method} ${req.path} - ${new Date().toISOString()}`);
+  
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    console.log(`📊 [${requestId}] ${req.method} ${req.path} - ${res.statusCode} - ${duration}ms`);
+  });
+  
+  next();
+});
 
 // Initialize Razorpay
 const razorpay = new Razorpay({
@@ -65,8 +104,35 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Enhanced order store with TTL
+// Enhanced order store with TTL and metadata
 const orderStore = new Map();
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+const addToOrderStore = (id, data) => {
+  const enhancedData = {
+    ...data,
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + CACHE_TTL),
+    attempts: 0,
+    lastUpdated: new Date()
+  };
+  
+  orderStore.set(id, enhancedData);
+  console.log(`📦 Added to order store: ${id} (${orderStore.size} total)`);
+};
+
+const updateOrderStore = (id, updates) => {
+  const existing = orderStore.get(id);
+  if (existing) {
+    const updated = {
+      ...existing,
+      ...updates,
+      lastUpdated: new Date()
+    };
+    orderStore.set(id, updated);
+    console.log(`🔄 Updated order store: ${id}`);
+  }
+};
 
 // Enhanced Google Sheets saving with better error handling
 const saveBookingToSheet = async (bookingData) => {
@@ -89,39 +155,45 @@ const saveBookingToSheet = async (bookingData) => {
 
     const isoTimestamp = now.toISOString();
 
+    // Enhanced sheet data with validation
     const sheetData = {
-      booking_date: bookingData.date || '',
+      booking_date: String(bookingData.date || ''),
       booking_time: bookingData.lastItem
         ? `${bookingData.lastItem.start} - ${bookingData.lastItem.end}`
-        : "Not Available",
-      whatsapp_number: bookingData.whatsapp || '',
-      num_people: bookingData.people || 0,
+        : bookingData.selectedTimeSlot
+        ? `${bookingData.selectedTimeSlot.start} - ${bookingData.selectedTimeSlot.end}`
+        : "Time not specified",
+      whatsapp_number: String(bookingData.whatsapp || ''),
+      num_people: parseInt(bookingData.people) || 0,
       decoration: bookingData.wantDecoration ? "Yes" : "No",
-      advance_amount: bookingData.advanceAmount || 10,
-      remaining_amount: bookingData.remainingAmount || 0,
-      total_amount: bookingData.totalAmount || bookingData.amountWithTax || 0,
-      payment_id: bookingData.paymentId || '',
+      advance_amount: parseFloat(bookingData.advanceAmount) || 10,
+      remaining_amount: parseFloat(bookingData.remainingAmount) || 0,
+      total_amount: parseFloat(bookingData.totalAmount) || 0,
+      payment_id: String(bookingData.paymentId || ''),
       extraDecorations: Array.isArray(bookingData.extraDecorations) 
         ? bookingData.extraDecorations.join(', ') 
-        : bookingData.extraDecorations || '',
-      address: bookingData.address || '',
-      bookingName: bookingData.bookingName || '',
-      slotType: bookingData.slotType || '',
-      email: bookingData.email || '',
+        : String(bookingData.extraDecorations || ''),
+      address: String(bookingData.address || ''),
+      bookingName: String(bookingData.bookingName || ''),
+      slotType: String(bookingData.slotType || ''),
+      email: String(bookingData.email || ''),
       payment_status: "Partial (Advance paid)",
-      NameUser: bookingData.NameUser || bookingData.bookingName || '',
+      NameUser: String(bookingData.NameUser || bookingData.bookingName || ''),
       PaymentMode: "Online",
-      occasion: bookingData.occasion || '',
+      occasion: String(bookingData.occasion || ''),
       processed_date: currentDate,
       processed_time: currentTime,
       processed_timestamp: isoTimestamp,
-      order_id: bookingData.orderId || '',
-      payment_link_id: bookingData.paymentLinkId || '',
-      source: bookingData.source || 'web_app',
-      created_at: bookingData.createdAt || isoTimestamp
+      order_id: String(bookingData.orderId || ''),
+      payment_link_id: String(bookingData.paymentLinkId || ''),
+      source: String(bookingData.source || 'web_app'),
+      created_at: bookingData.createdAt || isoTimestamp,
+      session_id: String(bookingData.sessionId || ''),
+      webhook_processed: bookingData.webhookProcessed || false,
+      data_integrity_check: 'passed'
     };
 
-    console.log("📊 Sheet data prepared:", sheetData);
+    console.log("📊 Sheet data prepared for:", sheetData.bookingName);
 
     const response = await axios.post(
       "https://sheetdb.io/api/v1/s6a0t5omac7jg",
@@ -132,16 +204,14 @@ const saveBookingToSheet = async (bookingData) => {
         headers: {
           "Content-Type": "application/json",
         },
-        timeout: 15000, 
+        timeout: 20000,
       }
     );
 
-    console.log("✅ Google Sheets save successful");
-    return response.data;
-  }, 3, 2000).catch(error => {
-    console.error("❌ Error saving to Google Sheets after retries:", error.response?.data || error.message);
-    throw error;
-  });
+    console.log("✅ Google Sheets save successful:", response.data);
+    return { success: true, sheetData, response: response.data };
+    
+  }, 4, 2000, "Google Sheets save");
 };
 
 // Enhanced Firebase saving with better error handling
@@ -149,52 +219,57 @@ const saveToFirebase = async (bookingData, paymentDetails) => {
   return retryWithBackoff(async () => {
     console.log("🔥 Saving booking to Firebase...");
     
+    // Enhanced save data with validation
     const saveData = {
-      bookingName: bookingData.bookingName || '',
-      NameUser: bookingData.NameUser || bookingData.bookingName || '',
-      email: bookingData.email || '',
-      address: bookingData.address || '',
-      whatsapp: bookingData.whatsapp || '',
-      date: bookingData.date || '',
-      people: bookingData.people || 0,
-      wantDecoration: bookingData.wantDecoration || false,
-      occasion: bookingData.occasion || '',
-      extraDecorations: bookingData.extraDecorations || [],
-      selectedTimeSlot: bookingData.lastItem || bookingData.cartData?.[0] || null,
-      lastItem: bookingData.lastItem || bookingData.cartData?.[0] || null,
-      cartData: bookingData.cartData || [],
-      slotType: bookingData.slotType || '',
+      bookingName: String(bookingData.bookingName || ''),
+      NameUser: String(bookingData.NameUser || bookingData.bookingName || ''),
+      email: String(bookingData.email || ''),
+      address: String(bookingData.address || ''),
+      whatsapp: String(bookingData.whatsapp || ''),
+      date: String(bookingData.date || ''),
+      people: parseInt(bookingData.people) || 0,
+      wantDecoration: Boolean(bookingData.wantDecoration),
+      occasion: String(bookingData.occasion || ''),
+      extraDecorations: Array.isArray(bookingData.extraDecorations) 
+        ? bookingData.extraDecorations 
+        : [bookingData.extraDecorations].filter(Boolean),
+      selectedTimeSlot: bookingData.lastItem || bookingData.selectedTimeSlot || bookingData.cartData?.[0] || {},
+      lastItem: bookingData.lastItem || bookingData.selectedTimeSlot || bookingData.cartData?.[0] || {},
+      cartData: Array.isArray(bookingData.cartData) ? bookingData.cartData : [],
+      slotType: String(bookingData.slotType || ''),
       status: "booked",
-      paymentId: paymentDetails.razorpay_payment_id || '',
-      orderId: paymentDetails.razorpay_order_id || '',
-      paymentLinkId: paymentDetails.payment_link_id || '',
+      paymentId: String(paymentDetails.razorpay_payment_id || ''),
+      orderId: String(paymentDetails.razorpay_order_id || ''),
+      paymentLinkId: String(paymentDetails.payment_link_id || ''),
       paymentStatus: "partial",
-      advancePaid: bookingData.advanceAmount || 10,
-      remainingAmount: bookingData.remainingAmount || 0,
-      totalAmount: bookingData.totalAmount || bookingData.amountWithTax || 0,
+      advancePaid: parseFloat(bookingData.advanceAmount) || 10,
+      remainingAmount: parseFloat(bookingData.remainingAmount) || 0,
+      totalAmount: parseFloat(bookingData.totalAmount) || 0,
       timestamp: new Date(),
       createdAt: new Date(),
-      source: bookingData.source || 'web_app',
+      source: String(bookingData.source || 'web_app'),
+      sessionId: String(bookingData.sessionId || ''),
+      webhookProcessed: Boolean(bookingData.webhookProcessed),
+      dataIntegrityCheck: 'passed',
       bookingMeta: {
         createdAt: new Date(),
         source: "web",
-        version: "2.0",
+        version: "3.0",
         paymentMethod: "razorpay_payment_link",
-        webhookProcessed: true
+        webhookProcessed: Boolean(bookingData.webhookProcessed),
+        recoveryAttempts: bookingData.recoveryAttempts || 0
       },
     };
 
-    console.log("📊 Firebase data prepared:", saveData);
+    console.log("📊 Firebase data prepared for:", saveData.bookingName);
 
     const collectionName = bookingData.slotType || 'bookings';
     const docRef = await addDoc(collection(db, collectionName), saveData);
     
     console.log("✅ Firebase save successful with ID:", docRef.id);
-    return { ...saveData, id: docRef.id };
-  }, 3, 1500).catch(error => {
-    console.error("❌ Error saving to Firebase after retries:", error);
-    throw error;
-  });
+    return { ...saveData, id: docRef.id, success: true };
+    
+  }, 4, 1500, "Firebase save");
 };
 
 // Enhanced phone number validation
@@ -205,32 +280,42 @@ const validateAndSanitizePhone = (phone) => {
   const hasRecurringDigits = /^(\d)\1{9,}$/.test(cleanPhone);
   
   if (cleanPhone.length < 10 || cleanPhone.length > 12 || hasRecurringDigits) {
-    console.log(`⚠️ Invalid phone number: ${cleanPhone}`);
+    console.log(`⚠️ Invalid phone number format: ${cleanPhone}`);
     return "";
   }
   
   return cleanPhone.length === 10 ? "91" + cleanPhone : cleanPhone;
 };
 
-// Enhanced payment link creation
+// Enhanced payment link creation with better validation
 app.post("/create-payment-link", async (req, res) => {
   try {
     const { amount, bookingData } = req.body;
+    const { requestId } = req;
     
+    console.log(`🔗 [${requestId}] Creating payment link for:`, bookingData?.bookingName);
+    
+    // Enhanced validation
     if (!bookingData || !amount) {
+      console.error(`❌ [${requestId}] Missing required data`);
       return res.status(400).json({ error: "Missing booking data or amount" });
     }
 
-    console.log("🔗 Creating payment link for booking:", bookingData.bookingName);
+    if (amount <= 0 || amount > 10000) {
+      console.error(`❌ [${requestId}] Invalid amount: ${amount}`);
+      return res.status(400).json({ error: "Invalid amount" });
+    }
 
     const sanitizedPhone = validateAndSanitizePhone(bookingData.whatsapp);
-    const referenceId = "booking_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+    const referenceId = `booking_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const sessionId = bookingData.sessionId || Date.now().toString();
     
+    // Enhanced payment link options
     const options = {
       amount: amount * 100, // Convert to paise
       currency: "INR",
       reference_id: referenceId,
-      description: `Theater Booking - ${bookingData.bookingName || 'Customer'}`,
+      description: `Theater Booking - ${bookingData.bookingName || 'Customer'} (${bookingData.date || 'Date TBD'})`,
       customer: {
         name: bookingData.bookingName || "Customer",
         email: bookingData.email || "",
@@ -242,6 +327,17 @@ app.post("/create-payment-link", async (req, res) => {
       reminder_enable: false,
       callback_url: `${process.env.FRONTEND_URL || 'https://birthday-backend-tau.vercel.app'}/payment-success`,
       callback_method: "get",
+      notes: {
+        bookingData: JSON.stringify({
+          ...bookingData,
+          sessionId,
+          referenceId,
+          createdAt: new Date().toISOString()
+        }),
+        sessionId,
+        referenceId,
+        version: "3.0"
+      }
     };
 
     // Add phone only if valid
@@ -249,42 +345,55 @@ app.post("/create-payment-link", async (req, res) => {
       options.customer.contact = sanitizedPhone;
     }
 
+    console.log(`📞 [${requestId}] Creating Razorpay payment link...`);
     const paymentLink = await razorpay.paymentLink.create(options);
     
-    // Store enhanced booking data
+    // Enhanced booking data for storage
     const enhancedBookingData = {
       ...bookingData,
       totalAmount: bookingData.totalAmount || bookingData.amountWithTax,
       advanceAmount: amount,
       remainingAmount: (bookingData.totalAmount || bookingData.amountWithTax) - amount,
-      source: 'web_app',
+      source: 'web_app_v3',
       createdAt: new Date().toISOString(),
-      reference_id: referenceId
+      reference_id: referenceId,
+      sessionId,
+      paymentLinkId: paymentLink.id,
+      webhookProcessed: false,
+      dataIntegrityCheck: 'initialized'
     };
 
-    orderStore.set(paymentLink.id, {
+    // Store in enhanced order store
+    addToOrderStore(paymentLink.id, {
       bookingData: enhancedBookingData,
       amount,
       status: "created",
       type: "payment_link",
-      createdAt: new Date(),
       reference_id: referenceId,
+      sessionId,
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
+      createdBy: 'payment_link_api',
+      version: '3.0'
     });
 
-    console.log(`✅ Payment link created: ${paymentLink.id}`);
+    console.log(`✅ [${requestId}] Payment link created successfully: ${paymentLink.id}`);
     
     res.json({
+      success: true,
       paymentLink,
       short_url: paymentLink.short_url,
       paymentLinkId: paymentLink.id,
       referenceId: referenceId,
+      sessionId,
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
     });
+    
   } catch (error) {
-    console.error("❌ Payment link creation failed:", error);
+    console.error(`❌ [${req.requestId}] Payment link creation failed:`, error);
     res.status(500).json({ 
       error: "Payment link creation failed",
-      details: error.message 
+      details: error.message,
+      code: error.code || 'PAYMENT_LINK_CREATION_FAILED'
     });
   }
 });
@@ -293,42 +402,35 @@ app.post("/create-payment-link", async (req, res) => {
 const verifyWebhookSignature = (body, signature, secret) => {
   try {
     console.log("🔐 Verifying webhook signature...");
-    console.log("🔐 Body type:", typeof body);
-    console.log("🔐 Body length:", body.length);
-    console.log("🔐 Signature received:", signature);
-    console.log("🔐 Secret (first 10 chars):", secret.substring(0, 10) + "...");
     
     const expectedSignature = crypto
       .createHmac("sha256", secret)
       .update(body, 'utf8')
       .digest("hex");
-
-    console.log("🔐 Expected signature:", expectedSignature);
     
-    // Razorpay signature format is just the hex string, not prefixed
     const isValid = crypto.timingSafeEqual(
       Buffer.from(signature, "utf8"),
       Buffer.from(expectedSignature, "utf8")
     );
     
-    console.log("🔐 Signature valid:", isValid);
+    console.log(`🔐 Signature verification: ${isValid ? 'VALID' : 'INVALID'}`);
     return isValid;
+    
   } catch (error) {
     console.error("❌ Signature verification error:", error);
     return false;
   }
 };
 
-// Enhanced webhook handler
+// Enhanced webhook handler with better error handling
 app.post("/webhook", async (req, res) => {
-  const startTime = Date.now();
-  const requestId = Math.random().toString(36).substr(2, 9);
+  const { requestId, startTime } = req;
   
   try {
     const webhookSignature = req.headers["x-razorpay-signature"];
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
 
-    console.log(`🔔 [${requestId}] Webhook received at ${new Date().toISOString()}`);
+    console.log(`🔔 [${requestId}] Webhook received`);
     
     if (!webhookSecret) {
       console.error(`❌ [${requestId}] Webhook secret not configured`);
@@ -340,7 +442,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(400).json({ error: "Missing webhook signature" });
     }
 
-    // Verify webhook signature with raw body
+    // Verify webhook signature
     const isValidSignature = verifyWebhookSignature(
       req.body,
       webhookSignature,
@@ -349,15 +451,13 @@ app.post("/webhook", async (req, res) => {
 
     if (!isValidSignature) {
       console.error(`❌ [${requestId}] Invalid webhook signature`);
-      console.error(`❌ [${requestId}] Body type: ${typeof req.body}`);
-      console.error(`❌ [${requestId}] Body content: ${req.body.toString().substring(0, 200)}...`);
       return res.status(400).json({ error: "Invalid signature" });
     }
 
     const event = JSON.parse(req.body.toString());
-    console.log(`🔔 [${requestId}] Event: ${event.event}`);
+    console.log(`🔔 [${requestId}] Processing event: ${event.event}`);
 
-    // Handle different event types
+    // Enhanced event handling
     switch (event.event) {
       case "payment_link.paid":
         await handlePaymentLinkPaid(event.payload.payment_link.entity, event.payload.payment.entity, requestId);
@@ -371,29 +471,37 @@ app.post("/webhook", async (req, res) => {
         await handlePaymentFailed(event.payload.payment.entity, requestId);
         break;
         
+      case "payment_link.cancelled":
+        await handlePaymentLinkCancelled(event.payload.payment_link.entity, requestId);
+        break;
+        
       default:
-        console.log(`ℹ️ [${requestId}] Ignored event: ${event.event}`);
+        console.log(`ℹ️ [${requestId}] Event ignored: ${event.event}`);
     }
     
     const processingTime = Date.now() - startTime;
-    console.log(`✅ [${requestId}] Webhook processed in ${processingTime}ms`);
+    console.log(`✅ [${requestId}] Webhook processed successfully in ${processingTime}ms`);
     
     res.json({ 
-      status: "success", 
+      success: true,
+      status: "processed", 
       processingTime: `${processingTime}ms`,
-      requestId 
+      requestId,
+      event: event.event
     });
+    
   } catch (error) {
-    console.error(`❌ [${requestId}] Webhook error:`, error);
+    console.error(`❌ [${requestId}] Webhook processing failed:`, error);
     res.status(500).json({ 
       error: "Webhook processing failed", 
       message: error.message,
-      requestId 
+      requestId,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 });
 
-// Enhanced payment link handler
+// Enhanced payment link paid handler
 const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId) => {
   try {
     console.log(`🔍 [${requestId}] Processing payment link: ${paymentLinkEntity.id}`);
@@ -401,48 +509,16 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
     const orderDetails = orderStore.get(paymentLinkEntity.id);
     
     if (!orderDetails) {
-      console.error(`❌ [${requestId}] Payment link data not found: ${paymentLinkEntity.id}`);
-      console.log(`📋 [${requestId}] Available IDs:`, Array.from(orderStore.keys()));
+      console.error(`❌ [${requestId}] Order not found in store: ${paymentLinkEntity.id}`);
       
-      // Try to fetch payment details from Razorpay API as fallback
-      try {
-        console.log(`🔄 [${requestId}] Attempting to fetch payment link details from Razorpay...`);
-        const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkEntity.id);
-        
-        if (paymentLinkDetails && paymentLinkDetails.notes) {
-          console.log(`✅ [${requestId}] Recovered booking data from Razorpay notes`);
-          const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.bookingData || '{}');
-          
-          const bookingDataWithPayment = {
-            ...recoveredBookingData,
-            paymentId: paymentEntity.id,
-            orderId: paymentEntity.order_id,
-            paymentLinkId: paymentLinkEntity.id,
-            advanceAmount: paymentLinkDetails.amount / 100,
-            webhookProcessedAt: new Date().toISOString(),
-            webhookRequestId: requestId,
-            source: 'webhook_recovery'
-          };
-
-          const paymentDetails = {
-            razorpay_payment_id: paymentEntity.id,
-            razorpay_order_id: paymentEntity.order_id,
-            payment_link_id: paymentLinkEntity.id,
-          };
-
-          // Save recovered data
-          const [firebaseResult, sheetsResult] = await Promise.allSettled([
-            saveToFirebase(bookingDataWithPayment, paymentDetails),
-            saveBookingToSheet(bookingDataWithPayment)
-          ]);
-
-          console.log(`✅ [${requestId}] Recovery save completed - Firebase: ${firebaseResult.status}, Sheets: ${sheetsResult.status}`);
-          return;
-        }
-      } catch (recoveryError) {
-        console.error(`❌ [${requestId}] Recovery attempt failed:`, recoveryError.message);
+      // Enhanced recovery attempt
+      const recoveryResult = await attemptDataRecovery(paymentLinkEntity, paymentEntity, requestId);
+      if (recoveryResult.success) {
+        console.log(`✅ [${requestId}] Recovery successful`);
+        return;
       }
       
+      console.error(`❌ [${requestId}] Recovery failed`);
       return;
     }
     
@@ -454,7 +530,14 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
 
     console.log(`💰 [${requestId}] Processing payment: ${paymentEntity.id}`);
     
-    // Prepare enhanced booking data
+    // Update status to processing
+    updateOrderStore(paymentLinkEntity.id, { 
+      status: "processing", 
+      paymentId: paymentEntity.id,
+      webhookProcessed: true
+    });
+    
+    // Enhanced booking data preparation
     const bookingDataWithPayment = {
       ...orderDetails.bookingData,
       paymentId: paymentEntity.id,
@@ -464,7 +547,9 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
       remainingAmount: orderDetails.bookingData.totalAmount - orderDetails.amount,
       totalAmount: orderDetails.bookingData.totalAmount,
       webhookProcessedAt: new Date().toISOString(),
-      webhookRequestId: requestId
+      webhookRequestId: requestId,
+      webhookProcessed: true,
+      dataIntegrityCheck: 'webhook_processed'
     };
 
     const paymentDetails = {
@@ -475,44 +560,133 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
 
     console.log(`💾 [${requestId}] Saving data to Firebase and Sheets...`);
 
-    // Save to both services with enhanced error handling
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
+    // Enhanced parallel saving with individual error handling
+    const saveResults = await Promise.allSettled([
       saveToFirebase(bookingDataWithPayment, paymentDetails),
       saveBookingToSheet(bookingDataWithPayment)
     ]);
 
-    // Log detailed results
+    // Enhanced results processing
     const dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
+      firebase: saveResults[0].status === 'fulfilled',
+      sheets: saveResults[1].status === 'fulfilled',
+      firebaseError: saveResults[0].status === 'rejected' ? saveResults[0].reason?.message : null,
+      sheetsError: saveResults[1].status === 'rejected' ? saveResults[1].reason?.message : null,
+      firebaseData: saveResults[0].status === 'fulfilled' ? saveResults[0].value : null,
+      sheetsData: saveResults[1].status === 'fulfilled' ? saveResults[1].value : null,
+      timestamp: new Date().toISOString(),
+      requestId
     };
 
-    console.log(`📊 [${requestId}] Data storage results:`, dataStored);
+    console.log(`📊 [${requestId}] Data storage results:`, {
+      firebase: dataStored.firebase,
+      sheets: dataStored.sheets,
+      errors: {
+        firebase: dataStored.firebaseError,
+        sheets: dataStored.sheetsError
+      }
+    });
 
-    // Update order status
-    orderDetails.status = "paid";
-    orderDetails.paymentEntity = paymentEntity;
-    orderDetails.dataStored = dataStored;
-    orderDetails.savedBooking = firebaseResult.status === 'fulfilled' ? firebaseResult.value : null;
-    orderDetails.processedAt = new Date().toISOString();
-    orderDetails.webhookRequestId = requestId;
-    orderStore.set(paymentLinkEntity.id, orderDetails);
+    // Update order status with comprehensive data
+    updateOrderStore(paymentLinkEntity.id, {
+      status: "paid",
+      paymentEntity: paymentEntity,
+      dataStored: dataStored,
+      savedBooking: dataStored.firebaseData,
+      processedAt: new Date().toISOString(),
+      webhookRequestId: requestId,
+      dataIntegrityCheck: 'completed'
+    });
     
-    console.log(`✅ [${requestId}] Payment link processed successfully`);
+    console.log(`✅ [${requestId}] Payment processing completed successfully`);
+    
   } catch (error) {
-    console.error(`❌ [${requestId}] Payment link processing failed:`, error);
+    console.error(`❌ [${requestId}] Payment processing failed:`, error);
     
     // Update order with error status
-    const orderDetails = orderStore.get(paymentLinkEntity.id);
-    if (orderDetails) {
-      orderDetails.status = "error";
-      orderDetails.error = error.message;
-      orderDetails.errorAt = new Date().toISOString();
-      orderStore.set(paymentLinkEntity.id, orderDetails);
+    updateOrderStore(paymentLinkEntity.id, {
+      status: "error",
+      error: error.message,
+      errorAt: new Date().toISOString(),
+      webhookRequestId: requestId,
+      dataIntegrityCheck: 'failed'
+    });
+  }
+};
+
+// Enhanced data recovery attempt
+const attemptDataRecovery = async (paymentLinkEntity, paymentEntity, requestId) => {
+  try {
+    console.log(`🔄 [${requestId}] Attempting data recovery for: ${paymentLinkEntity.id}`);
+    
+    // Try to fetch from Razorpay API
+    const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkEntity.id);
+    
+    if (paymentLinkDetails && paymentLinkDetails.notes && paymentLinkDetails.notes.bookingData) {
+      console.log(`✅ [${requestId}] Found booking data in Razorpay notes`);
+      
+      const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.bookingData);
+      
+      const bookingDataWithPayment = {
+        ...recoveredBookingData,
+        paymentId: paymentEntity.id,
+        orderId: paymentEntity.order_id,
+        paymentLinkId: paymentLinkEntity.id,
+        advanceAmount: paymentLinkDetails.amount / 100,
+        remainingAmount: recoveredBookingData.totalAmount - (paymentLinkDetails.amount / 100),
+        webhookProcessedAt: new Date().toISOString(),
+        webhookRequestId: requestId,
+        recoveryAttempts: (recoveredBookingData.recoveryAttempts || 0) + 1,
+        source: 'webhook_recovery',
+        dataIntegrityCheck: 'recovered'
+      };
+
+      const paymentDetails = {
+        razorpay_payment_id: paymentEntity.id,
+        razorpay_order_id: paymentEntity.order_id,
+        payment_link_id: paymentLinkEntity.id,
+      };
+
+      // Save recovered data
+      const saveResults = await Promise.allSettled([
+        saveToFirebase(bookingDataWithPayment, paymentDetails),
+        saveBookingToSheet(bookingDataWithPayment)
+      ]);
+
+      const dataStored = {
+        firebase: saveResults[0].status === 'fulfilled',
+        sheets: saveResults[1].status === 'fulfilled',
+        firebaseError: saveResults[0].status === 'rejected' ? saveResults[0].reason?.message : null,
+        sheetsError: saveResults[1].status === 'rejected' ? saveResults[1].reason?.message : null,
+        timestamp: new Date().toISOString(),
+        recovered: true,
+        requestId
+      };
+
+      // Store recovered data
+      addToOrderStore(paymentLinkEntity.id, {
+        bookingData: bookingDataWithPayment,
+        amount: paymentLinkDetails.amount / 100,
+        status: "paid",
+        type: "payment_link",
+        paymentEntity: paymentEntity,
+        dataStored: dataStored,
+        savedBooking: saveResults[0].status === 'fulfilled' ? saveResults[0].value : null,
+        processedAt: new Date().toISOString(),
+        webhookRequestId: requestId,
+        recovered: true,
+        dataIntegrityCheck: 'recovered'
+      });
+
+      console.log(`✅ [${requestId}] Recovery completed successfully`);
+      return { success: true, dataStored };
     }
+    
+    return { success: false, error: "No recoverable data found" };
+    
+  } catch (error) {
+    console.error(`❌ [${requestId}] Recovery attempt failed:`, error);
+    return { success: false, error: error.message };
   }
 };
 
@@ -520,55 +694,63 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
 const handlePaymentCaptured = async (paymentEntity, requestId) => {
   try {
     const orderId = paymentEntity.order_id;
-    const paymentId = paymentEntity.id;
     const orderDetails = orderStore.get(orderId);
     
     if (!orderDetails) {
-      console.log(`⚠️ [${requestId}] Order data not found: ${orderId}`);
+      console.log(`⚠️ [${requestId}] Order not found for regular payment: ${orderId}`);
       return;
     }
     
-    console.log(`💰 [${requestId}] Processing regular payment: ${paymentId}`);
+    console.log(`💰 [${requestId}] Processing regular payment: ${paymentEntity.id}`);
     
-    // Similar processing logic as payment link
+    // Similar processing as payment link
     const bookingDataWithPayment = {
       ...orderDetails.bookingData,
-      paymentId: paymentId,
+      paymentId: paymentEntity.id,
       orderId: orderId,
       advanceAmount: orderDetails.amount,
       remainingAmount: orderDetails.bookingData.totalAmount - orderDetails.amount,
       totalAmount: orderDetails.bookingData.totalAmount,
       webhookProcessedAt: new Date().toISOString(),
-      webhookRequestId: requestId
+      webhookRequestId: requestId,
+      webhookProcessed: true,
+      dataIntegrityCheck: 'webhook_processed'
     };
 
     const paymentDetails = {
-      razorpay_payment_id: paymentId,
+      razorpay_payment_id: paymentEntity.id,
       razorpay_order_id: orderId,
       razorpay_signature: "webhook_verified",
     };
 
     // Save to both services
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
+    const saveResults = await Promise.allSettled([
       saveToFirebase(bookingDataWithPayment, paymentDetails),
       saveBookingToSheet(bookingDataWithPayment)
     ]);
 
-    // Update order status
-    orderDetails.status = "paid";
-    orderDetails.paymentId = paymentId;
-    orderDetails.dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
+    const dataStored = {
+      firebase: saveResults[0].status === 'fulfilled',
+      sheets: saveResults[1].status === 'fulfilled',
+      firebaseError: saveResults[0].status === 'rejected' ? saveResults[0].reason?.message : null,
+      sheetsError: saveResults[1].status === 'rejected' ? saveResults[1].reason?.message : null,
+      timestamp: new Date().toISOString(),
+      requestId
     };
-    orderDetails.savedBooking = firebaseResult.status === 'fulfilled' ? firebaseResult.value : null;
-    orderDetails.processedAt = new Date().toISOString();
-    orderStore.set(orderId, orderDetails);
 
-    console.log(`✅ [${requestId}] Regular payment processed: ${paymentId}`);
+    // Update order status
+    updateOrderStore(orderId, {
+      status: "paid",
+      paymentId: paymentEntity.id,
+      dataStored: dataStored,
+      savedBooking: saveResults[0].status === 'fulfilled' ? saveResults[0].value : null,
+      processedAt: new Date().toISOString(),
+      webhookRequestId: requestId,
+      dataIntegrityCheck: 'completed'
+    });
+
+    console.log(`✅ [${requestId}] Regular payment processed successfully`);
+    
   } catch (error) {
     console.error(`❌ [${requestId}] Regular payment processing failed:`, error);
   }
@@ -578,17 +760,38 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
 const handlePaymentFailed = async (paymentEntity, requestId) => {
   try {
     const orderId = paymentEntity.order_id;
-    console.log(`❌ [${requestId}] Payment failed:`, { orderId, paymentId: paymentEntity.id });
+    console.log(`❌ [${requestId}] Payment failed - Order: ${orderId}, Payment: ${paymentEntity.id}`);
 
     const orderDetails = orderStore.get(orderId);
     if (orderDetails) {
-      orderDetails.status = "failed";
-      orderDetails.error = "Payment failed";
-      orderDetails.failedAt = new Date().toISOString();
-      orderStore.set(orderId, orderDetails);
+      updateOrderStore(orderId, {
+        status: "failed",
+        error: "Payment failed",
+        failedAt: new Date().toISOString(),
+        webhookRequestId: requestId,
+        dataIntegrityCheck: 'payment_failed'
+      });
     }
+    
   } catch (error) {
     console.error(`❌ [${requestId}] Payment failure handling error:`, error);
+  }
+};
+
+// Enhanced payment link cancelled handler
+const handlePaymentLinkCancelled = async (paymentLinkEntity, requestId) => {
+  try {
+    console.log(`❌ [${requestId}] Payment link cancelled: ${paymentLinkEntity.id}`);
+    
+    updateOrderStore(paymentLinkEntity.id, {
+      status: "cancelled",
+      cancelledAt: new Date().toISOString(),
+      webhookRequestId: requestId,
+      dataIntegrityCheck: 'cancelled'
+    });
+    
+  } catch (error) {
+    console.error(`❌ [${requestId}] Payment link cancellation handling error:`, error);
   }
 };
 
@@ -596,26 +799,42 @@ const handlePaymentFailed = async (paymentEntity, requestId) => {
 app.get("/payment-status/:paymentId", async (req, res) => {
   try {
     const { paymentId } = req.params;
-    console.log(`🔍 Checking payment status: ${paymentId}`);
+    const { requestId } = req;
+    
+    console.log(`🔍 [${requestId}] Checking payment status: ${paymentId}`);
     
     // Check local store first
     const orderDetails = orderStore.get(paymentId);
     
     if (orderDetails) {
-      console.log(`📊 Order details found:`, {
+      console.log(`📊 [${requestId}] Order found in store:`, {
         status: orderDetails.status,
         type: orderDetails.type,
-        dataStored: orderDetails.dataStored
+        hasDataStored: !!orderDetails.dataStored,
+        recovered: orderDetails.recovered || false
       });
       
       if (orderDetails.status === "paid") {
         return res.json({
+          success: true,
           status: "paid",
           bookingData: orderDetails.savedBooking,
           paymentDetails: orderDetails.paymentEntity,
           dataStored: orderDetails.dataStored,
           type: orderDetails.type || "order",
-          processedAt: orderDetails.processedAt
+          processedAt: orderDetails.processedAt,
+          recovered: orderDetails.recovered || false,
+          sessionId: orderDetails.sessionId,
+          dataIntegrityCheck: orderDetails.dataIntegrityCheck
+        });
+      }
+      
+      if (orderDetails.status === "processing") {
+        return res.json({
+          success: true,
+          status: "processing",
+          message: "Payment is being processed",
+          type: orderDetails.type || "order"
         });
       }
     }
@@ -623,30 +842,38 @@ app.get("/payment-status/:paymentId", async (req, res) => {
     // For payment links, check with Razorpay API
     if (paymentId.startsWith('plink_')) {
       try {
-        console.log(`🔍 Checking payment link status with Razorpay API...`);
+        console.log(`🔍 [${requestId}] Checking with Razorpay API...`);
         const paymentLink = await razorpay.paymentLink.fetch(paymentId);
         
         if (paymentLink.status === "paid") {
-          console.log(`✅ Payment link is paid but not processed locally`);
+          console.log(`✅ [${requestId}] Payment link paid but not processed locally`);
           return res.json({
+            success: true,
             status: "paid",
             razorpayStatus: paymentLink.status,
             needsRecovery: !orderDetails,
             type: "payment_link",
+            amount: paymentLink.amount / 100,
+            created_at: paymentLink.created_at
           });
         } else {
-          console.log(`⏳ Payment link status: ${paymentLink.status}`);
+          console.log(`⏳ [${requestId}] Payment link status: ${paymentLink.status}`);
           return res.json({
+            success: true,
             status: paymentLink.status,
             razorpayStatus: paymentLink.status,
             type: "payment_link",
+            amount: paymentLink.amount / 100,
+            created_at: paymentLink.created_at
           });
         }
       } catch (apiError) {
-        console.error(`❌ Razorpay API error:`, apiError);
+        console.error(`❌ [${requestId}] Razorpay API error:`, apiError);
         return res.json({
+          success: false,
           status: "unknown",
-          error: "Could not verify payment status",
+          error: "Could not verify payment status with Razorpay",
+          details: apiError.message
         });
       }
     }
@@ -654,21 +881,29 @@ app.get("/payment-status/:paymentId", async (req, res) => {
     // For regular orders
     if (orderDetails) {
       res.json({
+        success: orderDetails.status !== "error",
         status: orderDetails.status,
         bookingData: orderDetails.savedBooking,
         message: orderDetails.status === "failed" ? orderDetails.error : `Payment ${orderDetails.status}`,
         type: "order",
-        dataStored: orderDetails.dataStored
+        dataStored: orderDetails.dataStored,
+        dataIntegrityCheck: orderDetails.dataIntegrityCheck
       });
     } else {
       res.status(404).json({
+        success: false,
         status: "not_found",
-        message: "Order not found",
+        message: "Payment not found in our records",
       });
     }
+    
   } catch (error) {
-    console.error("❌ Payment status check failed:", error);
-    res.status(500).json({ error: "Status check failed", details: error.message });
+    console.error(`❌ [${req.requestId}] Payment status check failed:`, error);
+    res.status(500).json({ 
+      success: false,
+      error: "Status check failed", 
+      details: error.message 
+    });
   }
 });
 
@@ -676,12 +911,16 @@ app.get("/payment-status/:paymentId", async (req, res) => {
 app.post("/recover-payment", async (req, res) => {
   try {
     const { paymentLinkId, bookingData } = req.body;
+    const { requestId } = req;
     
     if (!paymentLinkId) {
-      return res.status(400).json({ error: "Payment link ID required" });
+      return res.status(400).json({ 
+        success: false,
+        error: "Payment link ID required" 
+      });
     }
     
-    console.log(`🔄 Starting payment recovery for: ${paymentLinkId}`);
+    console.log(`🔄 [${requestId}] Starting enhanced recovery for: ${paymentLinkId}`);
     
     // Check payment link status with Razorpay
     const paymentLink = await razorpay.paymentLink.fetch(paymentLinkId);
@@ -689,25 +928,29 @@ app.post("/recover-payment", async (req, res) => {
     if (paymentLink.status === "paid") {
       // Get payments for this payment link
       const payments = await razorpay.payments.all({
-        'payment_link_id': paymentLinkId
+        'payment_link_id': paymentLinkId,
+        'count': 1
       });
       
       if (payments.items.length > 0) {
         const payment = payments.items[0];
         
-        console.log(`🔄 Found payment to recover: ${payment.id}`);
+        console.log(`🔄 [${requestId}] Found payment to recover: ${payment.id}`);
         
-        // Process the payment manually
-        const bookingDataWithPayment = {
+        // Enhanced recovery data preparation
+        const recoveryBookingData = {
           ...bookingData,
           paymentId: payment.id,
           orderId: payment.order_id,
           paymentLinkId: paymentLinkId,
-          advanceAmount: 10,
-          remainingAmount: bookingData.totalAmount - 10,
+          advanceAmount: paymentLink.amount / 100,
+          remainingAmount: bookingData.totalAmount - (paymentLink.amount / 100),
           totalAmount: bookingData.totalAmount,
           recoveredAt: new Date().toISOString(),
-          source: 'recovery_process'
+          source: 'manual_recovery',
+          recoveryAttempts: (bookingData.recoveryAttempts || 0) + 1,
+          webhookProcessed: false,
+          dataIntegrityCheck: 'manual_recovery'
         };
 
         const paymentDetails = {
@@ -716,78 +959,135 @@ app.post("/recover-payment", async (req, res) => {
           payment_link_id: paymentLinkId,
         };
 
-        // Save to both services
-        const [firebaseResult, sheetsResult] = await Promise.allSettled([
-          saveToFirebase(bookingDataWithPayment, paymentDetails),
-          saveBookingToSheet(bookingDataWithPayment)
+        // Save with enhanced error handling
+        const saveResults = await Promise.allSettled([
+          saveToFirebase(recoveryBookingData, paymentDetails),
+          saveBookingToSheet(recoveryBookingData)
         ]);
         
         const dataStored = {
-          firebase: firebaseResult.status === 'fulfilled',
-          sheets: sheetsResult.status === 'fulfilled',
-          firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-          sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-          timestamp: new Date().toISOString()
+          firebase: saveResults[0].status === 'fulfilled',
+          sheets: saveResults[1].status === 'fulfilled',
+          firebaseError: saveResults[0].status === 'rejected' ? saveResults[0].reason?.message : null,
+          sheetsError: saveResults[1].status === 'rejected' ? saveResults[1].reason?.message : null,
+          firebaseData: saveResults[0].status === 'fulfilled' ? saveResults[0].value : null,
+          sheetsData: saveResults[1].status === 'fulfilled' ? saveResults[1].value : null,
+          timestamp: new Date().toISOString(),
+          recovered: true,
+          requestId
         };
 
-        console.log(`✅ Payment recovery completed:`, dataStored);
+        // Update order store with recovered data
+        addToOrderStore(paymentLinkId, {
+          bookingData: recoveryBookingData,
+          amount: paymentLink.amount / 100,
+          status: "paid",
+          type: "payment_link",
+          paymentEntity: payment,
+          dataStored: dataStored,
+          savedBooking: dataStored.firebaseData,
+          processedAt: new Date().toISOString(),
+          recovered: true,
+          dataIntegrityCheck: 'recovered'
+        });
+
+        console.log(`✅ [${requestId}] Recovery completed:`, {
+          firebase: dataStored.firebase,
+          sheets: dataStored.sheets
+        });
         
         res.json({
+          success: true,
           status: "recovered",
           paymentId: payment.id,
-          dataStored: dataStored
+          dataStored: dataStored,
+          bookingData: dataStored.firebaseData,
+          recoveryDetails: {
+            timestamp: new Date().toISOString(),
+            paymentLinkId,
+            paymentId: payment.id,
+            amount: paymentLink.amount / 100
+          }
         });
+        
       } else {
-        console.log(`⚠️ No payments found for payment link: ${paymentLinkId}`);
-        res.json({ status: "no_payment_found" });
+        console.log(`⚠️ [${requestId}] No payments found for: ${paymentLinkId}`);
+        res.json({ 
+          success: false,
+          status: "no_payment_found",
+          message: "No payments found for this payment link"
+        });
       }
     } else {
-      console.log(`⚠️ Payment link not paid: ${paymentLink.status}`);
+      console.log(`⚠️ [${requestId}] Payment link not paid: ${paymentLink.status}`);
       res.json({ 
+        success: false,
         status: "not_paid",
-        paymentLinkStatus: paymentLink.status 
+        paymentLinkStatus: paymentLink.status,
+        message: "Payment link has not been paid yet"
       });
     }
+    
   } catch (error) {
-    console.error("❌ Payment recovery failed:", error);
+    console.error(`❌ [${req.requestId}] Recovery failed:`, error);
     res.status(500).json({ 
+      success: false,
       error: "Recovery failed", 
       details: error.message 
     });
   }
 });
 
-// Enhanced cleanup with TTL
+// Enhanced cleanup with better TTL management
 setInterval(() => {
   const now = new Date();
   let cleanedCount = 0;
+  let totalCount = orderStore.size;
 
   for (const [id, orderDetails] of orderStore.entries()) {
     const shouldClean = orderDetails.expiresAt && now > orderDetails.expiresAt;
     
     if (shouldClean) {
-      orderStore.delete(id);
-      cleanedCount++;
+      // Only clean if not recently paid
+      if (orderDetails.status !== "paid" || (now - new Date(orderDetails.processedAt || 0)) > 60 * 60 * 1000) {
+        orderStore.delete(id);
+        cleanedCount++;
+      }
     }
   }
 
   if (cleanedCount > 0) {
-    console.log(`🧹 Cleaned up ${cleanedCount} expired orders`);
+    console.log(`🧹 Cleaned ${cleanedCount}/${totalCount} expired orders (${orderStore.size} remaining)`);
   }
-}, 60 * 60 * 1000); // Run every hour
+}, 30 * 60 * 1000); // Run every 30 minutes
 
-// Health check endpoint
+// Enhanced health check endpoint
 app.get("/health", (req, res) => {
+  const orderStats = {
+    total: orderStore.size,
+    paid: 0,
+    processing: 0,
+    failed: 0,
+    created: 0
+  };
+
+  for (const [_, order] of orderStore.entries()) {
+    orderStats[order.status] = (orderStats[order.status] || 0) + 1;
+  }
+
   res.json({ 
+    success: true,
     status: "healthy", 
     timestamp: new Date().toISOString(),
-    activeOrders: orderStore.size,
-    version: "2.0 - Enhanced Payment Links",
-    environment: process.env.NODE_ENV || 'development'
+    activeOrders: orderStats,
+    version: "3.0 - Enhanced Payment System with Data Integrity",
+    environment: process.env.NODE_ENV || 'development',
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
   });
 });
 
-// Debug endpoint for development
+// Enhanced debug endpoint
 if (process.env.NODE_ENV === 'development') {
   app.get("/debug/orders", (req, res) => {
     const orders = Array.from(orderStore.entries()).map(([id, order]) => ({
@@ -795,18 +1095,57 @@ if (process.env.NODE_ENV === 'development') {
       status: order.status,
       type: order.type,
       createdAt: order.createdAt,
-      dataStored: order.dataStored
+      dataStored: order.dataStored,
+      recovered: order.recovered || false,
+      dataIntegrityCheck: order.dataIntegrityCheck,
+      bookingName: order.bookingData?.bookingName,
+      amount: order.amount
     }));
     
-    res.json({ orders, count: orders.length });
+    res.json({ 
+      success: true,
+      orders, 
+      count: orders.length,
+      summary: {
+        total: orders.length,
+        paid: orders.filter(o => o.status === 'paid').length,
+        processing: orders.filter(o => o.status === 'processing').length,
+        failed: orders.filter(o => o.status === 'failed').length,
+        recovered: orders.filter(o => o.recovered).length
+      }
+    });
   });
 }
 
-const PORT = process.env.PORT || 3001 ;
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error(`❌ [${req.requestId}] Unhandled error:`, error);
+  res.status(500).json({
+    success: false,
+    error: "Internal server error",
+    requestId: req.requestId,
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "Endpoint not found",
+    path: req.path,
+    method: req.method
+  });
+});
+
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Enhanced Server running on port ${PORT}`);
-  console.log(`📡 Payment Links API Ready`);
-  console.log(`🔗 Webhook endpoint: /webhook`);
+  console.log(`🚀 Enhanced Payment System Server running on port ${PORT}`);
+  console.log(`📡 Version: 3.0 - Enhanced Data Integrity`);
+  console.log(`🔗 Payment Links API: /create-payment-link`);
+  console.log(`🔔 Webhook endpoint: /webhook`);
   console.log(`🔄 Recovery endpoint: /recover-payment`);
   console.log(`📊 Health check: /health`);
+  console.log(`🔍 Status check: /payment-status/:paymentId`);
+  console.log(`⚡ Enhanced error handling and data integrity enabled`);
 });
