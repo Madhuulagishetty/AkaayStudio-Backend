@@ -393,6 +393,59 @@ app.post("/create-payment-link", async (req, res) => {
 
     console.log(`✅ Payment link created: ${paymentLink.id}`);
     console.log(`📦 Order data stored with keys: ${paymentLink.id}, ${referenceId}`);
+
+    // IMMEDIATE DATA SAVE: Save booking data immediately when payment link is created
+    // This ensures data is not lost even if webhook fails
+    try {
+      console.log(`💾 Saving booking data immediately for payment link: ${paymentLink.id}`);
+      
+      const immediateBookingData = {
+        ...enhancedBookingData,
+        paymentLinkId: paymentLink.id,
+        immediatelyCreated: true,
+        immediatelyCreatedAt: new Date().toISOString(),
+        paymentStatus: "pending",
+        source: 'immediate_payment_link_creation'
+      };
+
+      const paymentDetails = {
+        razorpay_payment_id: null, // Will be updated when payment is made
+        razorpay_order_id: null,
+        payment_link_id: paymentLink.id,
+      };
+
+      // Save to both services immediately
+      const [firebaseResult, sheetsResult] = await Promise.allSettled([
+        saveToFirebase(immediateBookingData, paymentDetails),
+        saveBookingToSheet(immediateBookingData)
+      ]);
+
+      const immediateDataStored = {
+        firebase: firebaseResult.status === 'fulfilled',
+        sheets: sheetsResult.status === 'fulfilled',
+        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
+        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
+        timestamp: new Date().toISOString()
+      };
+
+      console.log(`📊 Immediate data storage results:`, immediateDataStored);
+
+      // Store the immediate save results
+      orderData.immediateDataStored = immediateDataStored;
+      orderStore.set(paymentLink.id, orderData);
+      orderStore.set(referenceId, orderData);
+
+      if (immediateDataStored.firebase && immediateDataStored.sheets) {
+        console.log(`✅ IMMEDIATE SAVE SUCCESS: Data saved to both Firebase and Sheets`);
+      } else if (immediateDataStored.firebase || immediateDataStored.sheets) {
+        console.log(`⚠️ IMMEDIATE SAVE PARTIAL: Data saved to ${immediateDataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+      } else {
+        console.log(`❌ IMMEDIATE SAVE FAILED: Data not saved to either service`);
+      }
+    } catch (immediateError) {
+      console.error(`❌ Immediate data save failed for payment link: ${paymentLink.id}`, immediateError);
+      // Don't fail the payment link creation if immediate save fails
+    }
     
     res.json({
       paymentLink,
@@ -696,6 +749,64 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
   } catch (error) {
     console.error(`❌ [${requestId}] Payment link processing failed:`, error);
     processedPayments.delete(paymentEntity.id); // Remove from processed set on error
+    
+    // Enhanced error handling: Try to save minimal data even if processing fails
+    try {
+      console.log(`🔧 [${requestId}] Attempting minimal data save for failed webhook processing...`);
+      
+      const minimalBookingData = {
+        paymentId: paymentEntity.id,
+        orderId: paymentEntity.order_id,
+        paymentLinkId: paymentLinkEntity.id,
+        totalAmount: paymentEntity.amount / 100,
+        advanceAmount: paymentEntity.amount / 100,
+        remainingAmount: 0,
+        source: 'webhook_error_recovery',
+        errorRecoveryAt: new Date().toISOString(),
+        originalError: error.message,
+        paymentStatus: "paid_but_processing_failed",
+        bookingName: 'Webhook Error Recovery',
+        NameUser: 'Webhook Error Recovery',
+        email: '',
+        address: '',
+        whatsapp: '',
+        people: 1,
+        wantDecoration: 'Yes',
+        extraDecorations: [],
+        slotType: 'deluxe',
+        occasion: 'Special Event'
+      };
+
+      const minimalPaymentDetails = {
+        razorpay_payment_id: paymentEntity.id,
+        razorpay_order_id: paymentEntity.order_id,
+        payment_link_id: paymentLinkEntity.id,
+      };
+
+      // Try to save minimal data
+      const [firebaseResult, sheetsResult] = await Promise.allSettled([
+        saveToFirebase(minimalBookingData, minimalPaymentDetails),
+        saveBookingToSheet(minimalBookingData)
+      ]);
+
+      const errorRecoveryResults = {
+        firebase: firebaseResult.status === 'fulfilled',
+        sheets: sheetsResult.status === 'fulfilled',
+        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
+        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
+        timestamp: new Date().toISOString()
+      };
+
+      console.log(`📊 [${requestId}] Error recovery data save results:`, errorRecoveryResults);
+
+      if (errorRecoveryResults.firebase || errorRecoveryResults.sheets) {
+        console.log(`✅ [${requestId}] ERROR RECOVERY SUCCESS: Minimal data saved to prevent complete loss`);
+      } else {
+        console.log(`❌ [${requestId}] ERROR RECOVERY FAILED: Unable to save even minimal data`);
+      }
+    } catch (recoveryError) {
+      console.error(`❌ [${requestId}] Error recovery also failed:`, recoveryError);
+    }
   }
 };
 
@@ -787,6 +898,63 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
   } catch (error) {
     console.error(`❌ [${requestId}] Payment captured processing failed:`, error);
     processedPayments.delete(paymentEntity.id); // Remove from processed set on error
+    
+    // Enhanced error handling for regular payments
+    try {
+      console.log(`🔧 [${requestId}] Attempting minimal data save for failed regular payment processing...`);
+      
+      const minimalBookingData = {
+        paymentId: paymentEntity.id,
+        orderId: paymentEntity.order_id,
+        totalAmount: paymentEntity.amount / 100,
+        advanceAmount: paymentEntity.amount / 100,
+        remainingAmount: 0,
+        source: 'regular_payment_error_recovery',
+        errorRecoveryAt: new Date().toISOString(),
+        originalError: error.message,
+        paymentStatus: "paid_but_processing_failed",
+        bookingName: 'Regular Payment Error Recovery',
+        NameUser: 'Regular Payment Error Recovery',
+        email: '',
+        address: '',
+        whatsapp: '',
+        people: 1,
+        wantDecoration: 'Yes',
+        extraDecorations: [],
+        slotType: 'deluxe',
+        occasion: 'Special Event'
+      };
+
+      const minimalPaymentDetails = {
+        razorpay_payment_id: paymentEntity.id,
+        razorpay_order_id: paymentEntity.order_id,
+        payment_link_id: null,
+      };
+
+      // Try to save minimal data
+      const [firebaseResult, sheetsResult] = await Promise.allSettled([
+        saveToFirebase(minimalBookingData, minimalPaymentDetails),
+        saveBookingToSheet(minimalBookingData)
+      ]);
+
+      const errorRecoveryResults = {
+        firebase: firebaseResult.status === 'fulfilled',
+        sheets: sheetsResult.status === 'fulfilled',
+        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
+        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
+        timestamp: new Date().toISOString()
+      };
+
+      console.log(`📊 [${requestId}] Regular payment error recovery results:`, errorRecoveryResults);
+
+      if (errorRecoveryResults.firebase || errorRecoveryResults.sheets) {
+        console.log(`✅ [${requestId}] REGULAR PAYMENT ERROR RECOVERY SUCCESS: Minimal data saved`);
+      } else {
+        console.log(`❌ [${requestId}] REGULAR PAYMENT ERROR RECOVERY FAILED: Unable to save data`);
+      }
+    } catch (recoveryError) {
+      console.error(`❌ [${requestId}] Regular payment error recovery also failed:`, recoveryError);
+    }
   }
 };
 
@@ -895,6 +1063,82 @@ app.get("/payment-status/:paymentId", async (req, res) => {
   } catch (error) {
     console.error("❌ Payment status check failed:", error);
     res.status(500).json({ error: "Status check failed", details: error.message });
+  }
+});
+
+// Backup data save endpoint for thank you page
+app.post("/save-backup-data", async (req, res) => {
+  try {
+    const { bookingData, paymentId, orderId } = req.body;
+    
+    if (!bookingData) {
+      return res.status(400).json({ error: "Booking data required" });
+    }
+    
+    console.log(`💾 Backup data save requested for payment: ${paymentId}`);
+    
+    // Ensure we have the payment details
+    const enhancedBookingData = {
+      ...bookingData,
+      paymentId: paymentId,
+      orderId: orderId,
+      backupSavedAt: new Date().toISOString(),
+      source: 'thankyou_page_backup'
+    };
+
+    const paymentDetails = {
+      razorpay_payment_id: paymentId,
+      razorpay_order_id: orderId,
+      payment_link_id: null,
+    };
+
+    console.log(`🔄 Processing backup save for: ${bookingData.bookingName || 'Unknown'}`);
+
+    // Save to both services with enhanced error handling
+    const [firebaseResult, sheetsResult] = await Promise.allSettled([
+      saveToFirebase(enhancedBookingData, paymentDetails),
+      saveBookingToSheet(enhancedBookingData)
+    ]);
+
+    // Log detailed results
+    const dataStored = {
+      firebase: firebaseResult.status === 'fulfilled',
+      sheets: sheetsResult.status === 'fulfilled',
+      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
+      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
+      timestamp: new Date().toISOString()
+    };
+
+    console.log(`📊 Backup data storage results:`, dataStored);
+
+    if (dataStored.firebase && dataStored.sheets) {
+      console.log(`✅ BACKUP SUCCESS: Data saved to both Firebase and Sheets`);
+      res.json({ 
+        status: "success", 
+        message: "Backup data saved successfully",
+        dataStored: dataStored
+      });
+    } else if (dataStored.firebase || dataStored.sheets) {
+      console.log(`⚠️ BACKUP PARTIAL: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+      res.json({ 
+        status: "partial", 
+        message: "Backup data partially saved",
+        dataStored: dataStored
+      });
+    } else {
+      console.log(`❌ BACKUP FAILED: Data not saved to either service`);
+      res.status(500).json({ 
+        status: "failed", 
+        message: "Failed to save backup data",
+        dataStored: dataStored
+      });
+    }
+  } catch (error) {
+    console.error("❌ Backup data save failed:", error);
+    res.status(500).json({ 
+      error: "Backup save failed", 
+      details: error.message 
+    });
   }
 });
 
@@ -1044,14 +1288,18 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     activeOrders: orderStore.size,
     processedPayments: processedPayments.size,
-    version: "3.0 - Enhanced Webhook Processing",
+    version: "3.1 - Enhanced Data Protection",
     environment: process.env.NODE_ENV || 'development',
     features: {
       webhookSignatureVerification: true,
       multipleOrderLookup: true,
       dataRecovery: true,
       retryLogic: true,
-      duplicateProtection: true
+      duplicateProtection: true,
+      immediateDataSave: true,
+      backupDataEndpoint: true,
+      thankyouPageBackup: true,
+      webhookErrorRecovery: true
     }
   });
 });
@@ -1091,13 +1339,17 @@ app.post("/test-webhook", (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Enhanced Server v3.0 running on port ${PORT}`);
+  console.log(`🚀 Enhanced Server v3.1 running on port ${PORT}`);
   console.log(`📡 Payment Links API Ready`);
   console.log(`🔗 Webhook endpoint: /webhook`);
   console.log(`🔄 Recovery endpoint: /recover-payment`);
+  console.log(`💾 Backup data endpoint: /save-backup-data`);
   console.log(`📊 Health check: /health`);
   console.log(`🧪 Test webhook: /test-webhook`);
-  console.log(`✅ Enhanced features enabled:`);
+  console.log(`✅ Enhanced data protection features enabled:`);
+  console.log(`   • Immediate data save on payment link creation`);
+  console.log(`   • Thank you page backup data save`);
+  console.log(`   • Webhook error recovery system`);
   console.log(`   • Improved webhook signature verification`);
   console.log(`   • Multiple order lookup strategies`);
   console.log(`   • Automatic data recovery system`);
