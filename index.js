@@ -283,7 +283,7 @@ const sanitizeName = (name) => {
     .trim()
     .replace(/[^\w\s.-]/g, "") // Keep only alphanumeric, spaces, dots, and hyphens
     .replace(/\s+/g, " ") // Replace multiple spaces with single space
-    .substring(0, 50) // Limit to 50 characters
+    .substring(0, 100) // Limit to 50 characters
     || "Customer"; // Fallback if empty after sanitization
 };
 // Enhanced payment link creation with better data storage
