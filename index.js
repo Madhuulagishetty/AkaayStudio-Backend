@@ -21,6 +21,20 @@ const Razorpay = require("razorpay");
 const cors = require("cors");
 require("dotenv").config();
 
+// Retry utility function
+const retryWithBackoff = async (fn, maxRetries = 3, baseDelay = 1000) => {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      const delay = baseDelay * Math.pow(2, i);
+      console.log(`🔄 Retry ${i + 1}/${maxRetries} after ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+};
+
 // Environment validation
 if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
   console.error("❌ Missing Razorpay credentials in environment variables");
@@ -56,7 +70,7 @@ const orderStore = new Map();
 
 // Enhanced Google Sheets saving with better error handling
 const saveBookingToSheet = async (bookingData) => {
-  try {
+  return retryWithBackoff(async () => {
     console.log("📝 Saving booking to Google Sheets...");
     
     const now = new Date();
@@ -124,15 +138,15 @@ const saveBookingToSheet = async (bookingData) => {
 
     console.log("✅ Google Sheets save successful");
     return response.data;
-  } catch (error) {
-    console.error("❌ Error saving to Google Sheets:", error.response?.data || error.message);
+  }, 3, 2000).catch(error => {
+    console.error("❌ Error saving to Google Sheets after retries:", error.response?.data || error.message);
     throw error;
-  }
+  });
 };
 
 // Enhanced Firebase saving with better error handling
 const saveToFirebase = async (bookingData, paymentDetails) => {
-  try {
+  return retryWithBackoff(async () => {
     console.log("🔥 Saving booking to Firebase...");
     
     const saveData = {
@@ -177,10 +191,10 @@ const saveToFirebase = async (bookingData, paymentDetails) => {
     
     console.log("✅ Firebase save successful with ID:", docRef.id);
     return { ...saveData, id: docRef.id };
-  } catch (error) {
-    console.error("❌ Error saving to Firebase:", error);
+  }, 3, 1500).catch(error => {
+    console.error("❌ Error saving to Firebase after retries:", error);
     throw error;
-  }
+  });
 };
 
 // Enhanced phone number validation
@@ -278,15 +292,27 @@ app.post("/create-payment-link", async (req, res) => {
 // Enhanced webhook signature verification
 const verifyWebhookSignature = (body, signature, secret) => {
   try {
+    console.log("🔐 Verifying webhook signature...");
+    console.log("🔐 Body type:", typeof body);
+    console.log("🔐 Body length:", body.length);
+    console.log("🔐 Signature received:", signature);
+    console.log("🔐 Secret (first 10 chars):", secret.substring(0, 10) + "...");
+    
     const expectedSignature = crypto
       .createHmac("sha256", secret)
-      .update(body)
+      .update(body, 'utf8')
       .digest("hex");
 
-    return crypto.timingSafeEqual(
+    console.log("🔐 Expected signature:", expectedSignature);
+    
+    // Razorpay signature format is just the hex string, not prefixed
+    const isValid = crypto.timingSafeEqual(
       Buffer.from(signature, "utf8"),
       Buffer.from(expectedSignature, "utf8")
     );
+    
+    console.log("🔐 Signature valid:", isValid);
+    return isValid;
   } catch (error) {
     console.error("❌ Signature verification error:", error);
     return false;
@@ -314,7 +340,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(400).json({ error: "Missing webhook signature" });
     }
 
-    // Verify webhook signature
+    // Verify webhook signature with raw body
     const isValidSignature = verifyWebhookSignature(
       req.body,
       webhookSignature,
@@ -323,10 +349,12 @@ app.post("/webhook", async (req, res) => {
 
     if (!isValidSignature) {
       console.error(`❌ [${requestId}] Invalid webhook signature`);
+      console.error(`❌ [${requestId}] Body type: ${typeof req.body}`);
+      console.error(`❌ [${requestId}] Body content: ${req.body.toString().substring(0, 200)}...`);
       return res.status(400).json({ error: "Invalid signature" });
     }
 
-    const event = JSON.parse(req.body);
+    const event = JSON.parse(req.body.toString());
     console.log(`🔔 [${requestId}] Event: ${event.event}`);
 
     // Handle different event types
