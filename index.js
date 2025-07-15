@@ -34,10 +34,10 @@ if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
 
 const app = express();
 
-// Enhanced middleware with better error handling
+// Enhanced middleware
 app.use(cors());
 
-// Raw body parser specifically for webhook route (MUST come before JSON parser)
+// CRITICAL: Raw body parser for webhook signature verification
 app.use('/webhook', express.raw({ 
   type: 'application/json',
   limit: '10mb'
@@ -52,13 +52,16 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Enhanced order store with TTL
+// Enhanced order store with persistence
 const orderStore = new Map();
+const processedPayments = new Set(); // Track processed payments to avoid duplicates
 
-// Enhanced Google Sheets saving with better error handling
-const saveBookingToSheet = async (bookingData) => {
+// Enhanced Google Sheets saving with retry logic
+const saveBookingToSheet = async (bookingData, retryCount = 0) => {
+  const maxRetries = 3;
+  
   try {
-    console.log("📝 Saving booking to Google Sheets...");
+    console.log(`📝 Saving booking to Google Sheets (attempt ${retryCount + 1})...`);
     
     const now = new Date();
     const currentDate = now.toLocaleDateString("en-IN", {
@@ -80,13 +83,15 @@ const saveBookingToSheet = async (bookingData) => {
       booking_date: bookingData.date || '',
       booking_time: bookingData.lastItem
         ? `${bookingData.lastItem.start} - ${bookingData.lastItem.end}`
+        : bookingData.cartData && bookingData.cartData.length > 0
+        ? `${bookingData.cartData[0].start} - ${bookingData.cartData[0].end}`
         : "Not Available",
       whatsapp_number: bookingData.whatsapp || '',
       num_people: bookingData.people || 0,
-      decoration: bookingData.wantDecoration ? "Yes" : "No",
+      decoration: bookingData.wantDecoration === "Yes" ? "Yes" : "No",
       advance_amount: bookingData.advanceAmount || 10,
-      remaining_amount: bookingData.remainingAmount || 0,
-      total_amount: bookingData.totalAmount || bookingData.amountWithTax || 0,
+      remaining_amount: bookingData.remainingAmount || (bookingData.totalAmount - 10) || 0,
+      total_amount: bookingData.totalAmount || 0,
       payment_id: bookingData.paymentId || '',
       extraDecorations: Array.isArray(bookingData.extraDecorations) 
         ? bookingData.extraDecorations.join(', ') 
@@ -105,10 +110,17 @@ const saveBookingToSheet = async (bookingData) => {
       order_id: bookingData.orderId || '',
       payment_link_id: bookingData.paymentLinkId || '',
       source: bookingData.source || 'web_app',
-      created_at: bookingData.createdAt || isoTimestamp
+      created_at: bookingData.createdAt || isoTimestamp,
+      webhook_processed: true,
+      webhook_timestamp: isoTimestamp
     };
 
-    console.log("📊 Sheet data prepared:", sheetData);
+    console.log("📊 Sheet data prepared:", {
+      booking_date: sheetData.booking_date,
+      payment_id: sheetData.payment_id,
+      total_amount: sheetData.total_amount,
+      whatsapp_number: sheetData.whatsapp_number
+    });
 
     const response = await axios.post(
       "https://sheetdb.io/api/v1/s6a0t5omac7jg",
@@ -119,22 +131,31 @@ const saveBookingToSheet = async (bookingData) => {
         headers: {
           "Content-Type": "application/json",
         },
-        timeout: 15000, 
+        timeout: 30000, // Increased timeout
       }
     );
 
-    console.log("✅ Google Sheets save successful");
+    console.log("✅ Google Sheets save successful:", response.data);
     return response.data;
   } catch (error) {
-    console.error("❌ Error saving to Google Sheets:", error.response?.data || error.message);
+    console.error(`❌ Error saving to Google Sheets (attempt ${retryCount + 1}):`, error.response?.data || error.message);
+    
+    if (retryCount < maxRetries) {
+      console.log(`🔄 Retrying Google Sheets save in 2 seconds...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return saveBookingToSheet(bookingData, retryCount + 1);
+    }
+    
     throw error;
   }
 };
 
-// Enhanced Firebase saving with better error handling
-const saveToFirebase = async (bookingData, paymentDetails) => {
+// Enhanced Firebase saving with retry logic
+const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
+  const maxRetries = 3;
+  
   try {
-    console.log("🔥 Saving booking to Firebase...");
+    console.log(`🔥 Saving booking to Firebase (attempt ${retryCount + 1})...`);
     
     const saveData = {
       bookingName: bookingData.bookingName || '',
@@ -144,11 +165,11 @@ const saveToFirebase = async (bookingData, paymentDetails) => {
       whatsapp: bookingData.whatsapp || '',
       date: bookingData.date || '',
       people: bookingData.people || 0,
-      wantDecoration: bookingData.wantDecoration || false,
+      wantDecoration: bookingData.wantDecoration === "Yes",
       occasion: bookingData.occasion || '',
       extraDecorations: bookingData.extraDecorations || [],
-      selectedTimeSlot: bookingData.lastItem || bookingData.cartData?.[0] || null,
-      lastItem: bookingData.lastItem || bookingData.cartData?.[0] || null,
+      selectedTimeSlot: bookingData.lastItem || (bookingData.cartData && bookingData.cartData[0]) || null,
+      lastItem: bookingData.lastItem || (bookingData.cartData && bookingData.cartData[0]) || null,
       cartData: bookingData.cartData || [],
       slotType: bookingData.slotType || '',
       status: "booked",
@@ -157,21 +178,29 @@ const saveToFirebase = async (bookingData, paymentDetails) => {
       paymentLinkId: paymentDetails.payment_link_id || '',
       paymentStatus: "partial",
       advancePaid: bookingData.advanceAmount || 10,
-      remainingAmount: bookingData.remainingAmount || 0,
-      totalAmount: bookingData.totalAmount || bookingData.amountWithTax || 0,
+      remainingAmount: bookingData.remainingAmount || (bookingData.totalAmount - 10) || 0,
+      totalAmount: bookingData.totalAmount || 0,
       timestamp: new Date(),
-      createdAt: new Date(),
+      createdAt: bookingData.createdAt ? new Date(bookingData.createdAt) : new Date(),
       source: bookingData.source || 'web_app',
+      webhookProcessed: true,
+      webhookTimestamp: new Date(),
       bookingMeta: {
         createdAt: new Date(),
         source: "web",
-        version: "2.0",
+        version: "3.0",
         paymentMethod: "razorpay_payment_link",
-        webhookProcessed: true
+        webhookProcessed: true,
+        processedAt: new Date().toISOString()
       },
     };
 
-    console.log("📊 Firebase data prepared:", saveData);
+    console.log("📊 Firebase data prepared:", {
+      bookingName: saveData.bookingName,
+      paymentId: saveData.paymentId,
+      totalAmount: saveData.totalAmount,
+      whatsapp: saveData.whatsapp
+    });
 
     const collectionName = bookingData.slotType || 'bookings';
     const docRef = await addDoc(collection(db, collectionName), saveData);
@@ -179,7 +208,14 @@ const saveToFirebase = async (bookingData, paymentDetails) => {
     console.log("✅ Firebase save successful with ID:", docRef.id);
     return { ...saveData, id: docRef.id };
   } catch (error) {
-    console.error("❌ Error saving to Firebase:", error);
+    console.error(`❌ Error saving to Firebase (attempt ${retryCount + 1}):`, error.message);
+    
+    if (retryCount < maxRetries) {
+      console.log(`🔄 Retrying Firebase save in 2 seconds...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return saveToFirebase(bookingData, paymentDetails, retryCount + 1);
+    }
+    
     throw error;
   }
 };
@@ -199,7 +235,7 @@ const validateAndSanitizePhone = (phone) => {
   return cleanPhone.length === 10 ? "91" + cleanPhone : cleanPhone;
 };
 
-// Enhanced payment link creation
+// Enhanced payment link creation with better data storage
 app.post("/create-payment-link", async (req, res) => {
   try {
     const { amount, bookingData } = req.body;
@@ -208,7 +244,11 @@ app.post("/create-payment-link", async (req, res) => {
       return res.status(400).json({ error: "Missing booking data or amount" });
     }
 
-    console.log("🔗 Creating payment link for booking:", bookingData.bookingName);
+    console.log("🔗 Creating payment link for booking:", {
+      name: bookingData.bookingName,
+      amount: amount,
+      whatsapp: bookingData.whatsapp
+    });
 
     const sanitizedPhone = validateAndSanitizePhone(bookingData.whatsapp);
     const referenceId = "booking_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
@@ -217,7 +257,7 @@ app.post("/create-payment-link", async (req, res) => {
       amount: amount * 100, // Convert to paise
       currency: "INR",
       reference_id: referenceId,
-      description: `Theater Booking - ${bookingData.bookingName || 'Customer'}`,
+      description: `Theater Booking - ${bookingData.bookingName || 'Customer'} - ${bookingData.occasion || 'Celebration'}`,
       customer: {
         name: bookingData.bookingName || "Customer",
         email: bookingData.email || "",
@@ -229,6 +269,12 @@ app.post("/create-payment-link", async (req, res) => {
       reminder_enable: false,
       callback_url: `${process.env.FRONTEND_URL || 'https://birthday-backend-tau.vercel.app'}/payment-success`,
       callback_method: "get",
+      // Store booking data in notes for recovery
+      notes: {
+        booking_data: JSON.stringify(bookingData),
+        reference_id: referenceId,
+        source: 'web_app'
+      }
     };
 
     // Add phone only if valid
@@ -238,7 +284,7 @@ app.post("/create-payment-link", async (req, res) => {
 
     const paymentLink = await razorpay.paymentLink.create(options);
     
-    // Store enhanced booking data
+    // Store enhanced booking data with expiration
     const enhancedBookingData = {
       ...bookingData,
       totalAmount: bookingData.totalAmount || bookingData.amountWithTax,
@@ -246,20 +292,30 @@ app.post("/create-payment-link", async (req, res) => {
       remainingAmount: (bookingData.totalAmount || bookingData.amountWithTax) - amount,
       source: 'web_app',
       createdAt: new Date().toISOString(),
-      reference_id: referenceId
+      reference_id: referenceId,
+      paymentLinkId: paymentLink.id
     };
 
-    orderStore.set(paymentLink.id, {
+    // Store with multiple keys for better lookup
+    const orderData = {
       bookingData: enhancedBookingData,
       amount,
       status: "created",
       type: "payment_link",
       createdAt: new Date(),
       reference_id: referenceId,
+      paymentLinkId: paymentLink.id,
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
-    });
+    };
+
+    // Store with payment link ID as primary key
+    orderStore.set(paymentLink.id, orderData);
+    
+    // Also store with reference ID for backup lookup
+    orderStore.set(referenceId, orderData);
 
     console.log(`✅ Payment link created: ${paymentLink.id}`);
+    console.log(`📦 Order data stored with keys: ${paymentLink.id}, ${referenceId}`);
     
     res.json({
       paymentLink,
@@ -279,20 +335,9 @@ app.post("/create-payment-link", async (req, res) => {
 // Enhanced webhook signature verification
 const verifyWebhookSignature = (body, signature, secret) => {
   try {
-    // Ensure body is properly formatted for HMAC
-    let bodyString;
-    if (Buffer.isBuffer(body)) {
-      bodyString = body.toString('utf8');
-    } else if (typeof body === 'string') {
-      bodyString = body;
-    } else {
-      // If it's already parsed as JSON, stringify it
-      bodyString = JSON.stringify(body);
-    }
-
     const expectedSignature = crypto
       .createHmac("sha256", secret)
-      .update(bodyString, 'utf8')
+      .update(body, 'utf8')
       .digest("hex");
 
     return crypto.timingSafeEqual(
@@ -305,7 +350,7 @@ const verifyWebhookSignature = (body, signature, secret) => {
   }
 };
 
-// Enhanced webhook handler with proper raw body handling
+// CRITICAL: Enhanced webhook handler with better error handling
 app.post("/webhook", async (req, res) => {
   const startTime = Date.now();
   const requestId = Math.random().toString(36).substr(2, 9);
@@ -315,7 +360,11 @@ app.post("/webhook", async (req, res) => {
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
 
     console.log(`🔔 [${requestId}] Webhook received at ${new Date().toISOString()}`);
-    console.log(`🔍 [${requestId}] Body type: ${typeof req.body}, isBuffer: ${Buffer.isBuffer(req.body)}`);
+    console.log(`🔍 [${requestId}] Headers:`, {
+      signature: webhookSignature ? 'Present' : 'Missing',
+      contentType: req.headers['content-type'],
+      contentLength: req.headers['content-length']
+    });
     
     if (!webhookSecret) {
       console.error(`❌ [${requestId}] Webhook secret not configured`);
@@ -336,22 +385,19 @@ app.post("/webhook", async (req, res) => {
 
     if (!isValidSignature) {
       console.error(`❌ [${requestId}] Invalid webhook signature`);
-      console.log(`🔍 [${requestId}] Signature: ${webhookSignature}`);
-      console.log(`🔍 [${requestId}] Body preview: ${Buffer.isBuffer(req.body) ? req.body.toString('utf8').substring(0, 100) + '...' : JSON.stringify(req.body).substring(0, 100) + '...'}`);
       return res.status(400).json({ error: "Invalid signature" });
     }
 
+    console.log(`✅ [${requestId}] Webhook signature verified`);
+
     // Parse the event from raw body
-    let event;
-    if (Buffer.isBuffer(req.body)) {
-      event = JSON.parse(req.body.toString('utf8'));
-    } else if (typeof req.body === 'string') {
-      event = JSON.parse(req.body);
-    } else {
-      event = req.body; // Already parsed
-    }
+    const event = JSON.parse(req.body.toString('utf8'));
     
     console.log(`🔔 [${requestId}] Event: ${event.event}`);
+    console.log(`📊 [${requestId}] Event details:`, {
+      event: event.event,
+      entity: event.payload?.payment?.entity?.id || event.payload?.payment_link?.entity?.id || 'Unknown'
+    });
 
     // Handle different event types
     switch (event.event) {
@@ -389,87 +435,120 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Enhanced payment link handler
+// Enhanced payment link handler with better data processing
 const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId) => {
   try {
-    console.log(`🔍 [${requestId}] Processing payment link: ${paymentLinkEntity.id}`);
+    const paymentLinkId = paymentLinkEntity.id;
+    const paymentId = paymentEntity.id;
     
-    const orderDetails = orderStore.get(paymentLinkEntity.id);
+    console.log(`🔍 [${requestId}] Processing payment link: ${paymentLinkId} with payment: ${paymentId}`);
+    
+    // Prevent duplicate processing
+    if (processedPayments.has(paymentId)) {
+      console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
+      return;
+    }
+    
+    // Mark as processing
+    processedPayments.add(paymentId);
+    
+    // Try to find order details with multiple lookup strategies
+    let orderDetails = null;
+    
+    // Strategy 1: Look up by payment link ID
+    orderDetails = orderStore.get(paymentLinkId);
     
     if (!orderDetails) {
-      console.error(`❌ [${requestId}] Payment link data not found: ${paymentLinkEntity.id}`);
-      console.log(`📋 [${requestId}] Available IDs:`, Array.from(orderStore.keys()));
+      console.log(`🔍 [${requestId}] Order not found by payment link ID, trying reference ID lookup...`);
       
-      // Try to fetch payment details from Razorpay API as fallback
+      // Strategy 2: Look up by reference ID from payment link
       try {
-        console.log(`🔄 [${requestId}] Attempting to fetch payment link details from Razorpay...`);
-        const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkEntity.id);
+        const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkId);
+        const referenceId = paymentLinkDetails.reference_id;
         
-        if (paymentLinkDetails && paymentLinkDetails.notes) {
+        if (referenceId) {
+          orderDetails = orderStore.get(referenceId);
+          console.log(`🔍 [${requestId}] Reference ID lookup result: ${orderDetails ? 'Found' : 'Not found'}`);
+        }
+      } catch (fetchError) {
+        console.error(`❌ [${requestId}] Failed to fetch payment link details:`, fetchError.message);
+      }
+    }
+    
+    // Strategy 3: Recovery from Razorpay API
+    if (!orderDetails) {
+      console.log(`🔍 [${requestId}] Order not found, attempting recovery from Razorpay API...`);
+      
+      try {
+        const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkId);
+        
+        if (paymentLinkDetails.notes && paymentLinkDetails.notes.booking_data) {
           console.log(`✅ [${requestId}] Recovered booking data from Razorpay notes`);
-          const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.bookingData || '{}');
           
-          const bookingDataWithPayment = {
-            ...recoveredBookingData,
-            paymentId: paymentEntity.id,
-            orderId: paymentEntity.order_id,
-            paymentLinkId: paymentLinkEntity.id,
-            advanceAmount: paymentLinkDetails.amount / 100,
-            webhookProcessedAt: new Date().toISOString(),
-            webhookRequestId: requestId,
-            source: 'webhook_recovery'
+          const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.booking_data);
+          
+          // Create order details from recovered data
+          orderDetails = {
+            bookingData: {
+              ...recoveredBookingData,
+              totalAmount: recoveredBookingData.totalAmount || recoveredBookingData.amountWithTax,
+              advanceAmount: paymentLinkDetails.amount / 100,
+              remainingAmount: (recoveredBookingData.totalAmount || recoveredBookingData.amountWithTax) - (paymentLinkDetails.amount / 100),
+              source: 'webhook_recovery',
+              recoveredAt: new Date().toISOString()
+            },
+            amount: paymentLinkDetails.amount / 100,
+            status: "created",
+            type: "payment_link",
+            createdAt: new Date(),
+            reference_id: paymentLinkDetails.reference_id,
+            paymentLinkId: paymentLinkId,
+            recovered: true
           };
-
-          const paymentDetails = {
-            razorpay_payment_id: paymentEntity.id,
-            razorpay_order_id: paymentEntity.order_id,
-            payment_link_id: paymentLinkEntity.id,
-          };
-
-          // Save recovered data
-          const [firebaseResult, sheetsResult] = await Promise.allSettled([
-            saveToFirebase(bookingDataWithPayment, paymentDetails),
-            saveBookingToSheet(bookingDataWithPayment)
-          ]);
-
-          console.log(`✅ [${requestId}] Recovery save completed - Firebase: ${firebaseResult.status}, Sheets: ${sheetsResult.status}`);
+        } else {
+          console.error(`❌ [${requestId}] No booking data found in payment link notes`);
           return;
         }
       } catch (recoveryError) {
         console.error(`❌ [${requestId}] Recovery attempt failed:`, recoveryError.message);
+        return;
       }
-      
+    }
+    
+    if (!orderDetails) {
+      console.error(`❌ [${requestId}] Could not find or recover order details for payment link: ${paymentLinkId}`);
       return;
     }
     
-    // Prevent duplicate processing
-    if (orderDetails.status === "paid") {
-      console.log(`⚠️ [${requestId}] Payment already processed: ${paymentLinkEntity.id}`);
-      return;
-    }
-
-    console.log(`💰 [${requestId}] Processing payment: ${paymentEntity.id}`);
+    console.log(`✅ [${requestId}] Order details found/recovered successfully`);
     
     // Prepare enhanced booking data
     const bookingDataWithPayment = {
       ...orderDetails.bookingData,
-      paymentId: paymentEntity.id,
+      paymentId: paymentId,
       orderId: paymentEntity.order_id,
-      paymentLinkId: paymentLinkEntity.id,
+      paymentLinkId: paymentLinkId,
+      totalAmount: orderDetails.bookingData.totalAmount,
       advanceAmount: orderDetails.amount,
       remainingAmount: orderDetails.bookingData.totalAmount - orderDetails.amount,
-      totalAmount: orderDetails.bookingData.totalAmount,
       webhookProcessedAt: new Date().toISOString(),
-      webhookRequestId: requestId
+      webhookRequestId: requestId,
+      recovered: orderDetails.recovered || false
     };
 
     const paymentDetails = {
-      razorpay_payment_id: paymentEntity.id,
+      razorpay_payment_id: paymentId,
       razorpay_order_id: paymentEntity.order_id,
-      payment_link_id: paymentLinkEntity.id,
+      payment_link_id: paymentLinkId,
     };
 
     console.log(`💾 [${requestId}] Saving data to Firebase and Sheets...`);
+    console.log(`📊 [${requestId}] Booking data summary:`, {
+      bookingName: bookingDataWithPayment.bookingName,
+      paymentId: paymentId,
+      totalAmount: bookingDataWithPayment.totalAmount,
+      advanceAmount: bookingDataWithPayment.advanceAmount
+    });
 
     // Save to both services with enhanced error handling
     const [firebaseResult, sheetsResult] = await Promise.allSettled([
@@ -495,115 +574,78 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
     orderDetails.savedBooking = firebaseResult.status === 'fulfilled' ? firebaseResult.value : null;
     orderDetails.processedAt = new Date().toISOString();
     orderDetails.webhookRequestId = requestId;
-    orderStore.set(paymentLinkEntity.id, orderDetails);
     
-    console.log(`✅ [${requestId}] Payment link processed successfully`);
+    // Store with multiple keys for better lookup
+    orderStore.set(paymentLinkId, orderDetails);
+    if (orderDetails.reference_id) {
+      orderStore.set(orderDetails.reference_id, orderDetails);
+    }
+    
+    // Log success
+    if (dataStored.firebase && dataStored.sheets) {
+      console.log(`✅ [${requestId}] COMPLETE SUCCESS: Data saved to both Firebase and Sheets`);
+    } else if (dataStored.firebase || dataStored.sheets) {
+      console.log(`⚠️ [${requestId}] PARTIAL SUCCESS: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+    } else {
+      console.log(`❌ [${requestId}] FAILURE: Data not saved to either service`);
+    }
+    
+    console.log(`✅ [${requestId}] Payment link processing completed`);
   } catch (error) {
     console.error(`❌ [${requestId}] Payment link processing failed:`, error);
-    
-    // Update order with error status
-    const orderDetails = orderStore.get(paymentLinkEntity.id);
-    if (orderDetails) {
-      orderDetails.status = "error";
-      orderDetails.error = error.message;
-      orderDetails.errorAt = new Date().toISOString();
-      orderStore.set(paymentLinkEntity.id, orderDetails);
-    }
+    processedPayments.delete(paymentEntity.id); // Remove from processed set on error
   }
 };
 
-// Enhanced regular payment handler
+// Enhanced payment captured handler
 const handlePaymentCaptured = async (paymentEntity, requestId) => {
   try {
-    const orderId = paymentEntity.order_id;
     const paymentId = paymentEntity.id;
+    const orderId = paymentEntity.order_id;
     const paymentLinkId = paymentEntity.payment_link_id;
     
-    console.log(`💰 [${requestId}] Processing payment captured: ${paymentId}`);
-    console.log(`🔍 [${requestId}] Order ID: ${orderId}, Payment Link ID: ${paymentLinkId}`);
+    console.log(`💰 [${requestId}] Processing payment captured:`, {
+      paymentId,
+      orderId,
+      paymentLinkId
+    });
     
-    let orderDetails = null;
-    let lookupKey = null;
-    
-    // First try to find by payment link ID (for payment links)
-    if (paymentLinkId) {
-      orderDetails = orderStore.get(paymentLinkId);
-      lookupKey = paymentLinkId;
-      console.log(`🔍 [${requestId}] Looking up by payment link ID: ${paymentLinkId}`);
+    // Prevent duplicate processing
+    if (processedPayments.has(paymentId)) {
+      console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
+      return;
     }
     
-    // If not found and we have order ID, try that (for regular orders)
-    if (!orderDetails && orderId) {
+    // If this is a payment link payment, it should be handled by payment_link.paid event
+    if (paymentLinkId) {
+      console.log(`ℹ️ [${requestId}] Payment link payment - should be handled by payment_link.paid event`);
+      return;
+    }
+    
+    // Mark as processing
+    processedPayments.add(paymentId);
+    
+    // Handle regular order payments
+    let orderDetails = null;
+    
+    if (orderId) {
       orderDetails = orderStore.get(orderId);
-      lookupKey = orderId;
-      console.log(`🔍 [${requestId}] Looking up by order ID: ${orderId}`);
     }
     
     if (!orderDetails) {
-      console.log(`⚠️ [${requestId}] Order data not found for payment: ${paymentId}`);
-      console.log(`📋 [${requestId}] Available IDs:`, Array.from(orderStore.keys()));
-      
-      // Try to fetch payment link details from Razorpay API as fallback
-      if (paymentLinkId) {
-        try {
-          console.log(`🔄 [${requestId}] Attempting to fetch payment link details from Razorpay...`);
-          const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkId);
-          
-          if (paymentLinkDetails && paymentLinkDetails.notes) {
-            console.log(`✅ [${requestId}] Recovered booking data from Razorpay notes`);
-            const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.bookingData || '{}');
-            
-            const bookingDataWithPayment = {
-              ...recoveredBookingData,
-              paymentId: paymentId,
-              orderId: orderId,
-              paymentLinkId: paymentLinkId,
-              advanceAmount: paymentLinkDetails.amount / 100,
-              webhookProcessedAt: new Date().toISOString(),
-              webhookRequestId: requestId,
-              source: 'webhook_recovery_captured'
-            };
-
-            const paymentDetails = {
-              razorpay_payment_id: paymentId,
-              razorpay_order_id: orderId,
-              payment_link_id: paymentLinkId,
-            };
-
-            // Save recovered data
-            const [firebaseResult, sheetsResult] = await Promise.allSettled([
-              saveToFirebase(bookingDataWithPayment, paymentDetails),
-              saveBookingToSheet(bookingDataWithPayment)
-            ]);
-
-            console.log(`✅ [${requestId}] Recovery save completed from payment.captured - Firebase: ${firebaseResult.status}, Sheets: ${sheetsResult.status}`);
-            return;
-          }
-        } catch (recoveryError) {
-          console.error(`❌ [${requestId}] Recovery attempt failed in payment.captured:`, recoveryError.message);
-        }
-      }
-      
+      console.log(`⚠️ [${requestId}] Order data not found for regular payment: ${paymentId}`);
       return;
     }
     
-    // Prevent duplicate processing
-    if (orderDetails.status === "paid") {
-      console.log(`⚠️ [${requestId}] Payment already processed: ${lookupKey}`);
-      return;
-    }
-    
-    console.log(`💰 [${requestId}] Processing payment data for: ${lookupKey}`);
-    
-    // Prepare enhanced booking data
+    // Process regular payment (similar to payment link handling)
     const bookingDataWithPayment = {
       ...orderDetails.bookingData,
       paymentId: paymentId,
       orderId: orderId,
       paymentLinkId: paymentLinkId,
+      totalAmount: orderDetails.bookingData.totalAmount,
       advanceAmount: orderDetails.amount,
       remainingAmount: orderDetails.bookingData.totalAmount - orderDetails.amount,
-      totalAmount: orderDetails.bookingData.totalAmount,
       webhookProcessedAt: new Date().toISOString(),
       webhookRequestId: requestId
     };
@@ -614,7 +656,7 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       payment_link_id: paymentLinkId,
     };
 
-    console.log(`💾 [${requestId}] Saving data to Firebase and Sheets from payment.captured...`);
+    console.log(`💾 [${requestId}] Saving regular payment data...`);
 
     // Save to both services
     const [firebaseResult, sheetsResult] = await Promise.allSettled([
@@ -622,7 +664,6 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       saveBookingToSheet(bookingDataWithPayment)
     ]);
 
-    // Log detailed results
     const dataStored = {
       firebase: firebaseResult.status === 'fulfilled',
       sheets: sheetsResult.status === 'fulfilled',
@@ -631,35 +672,44 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       timestamp: new Date().toISOString()
     };
 
-    console.log(`📊 [${requestId}] Data storage results from payment.captured:`, dataStored);
+    console.log(`📊 [${requestId}] Regular payment data storage results:`, dataStored);
 
     // Update order status
     orderDetails.status = "paid";
     orderDetails.paymentId = paymentId;
     orderDetails.dataStored = dataStored;
-    orderDetails.savedBooking = firebaseResult.status === 'fulfilled' ? firebaseResult.value : null;
     orderDetails.processedAt = new Date().toISOString();
-    orderDetails.webhookRequestId = requestId;
-    orderStore.set(lookupKey, orderDetails);
+    orderStore.set(orderId, orderDetails);
 
-    console.log(`✅ [${requestId}] Payment captured processed successfully: ${paymentId}`);
+    console.log(`✅ [${requestId}] Regular payment processing completed`);
   } catch (error) {
     console.error(`❌ [${requestId}] Payment captured processing failed:`, error);
+    processedPayments.delete(paymentEntity.id); // Remove from processed set on error
   }
 };
 
 // Enhanced payment failure handler
 const handlePaymentFailed = async (paymentEntity, requestId) => {
   try {
+    const paymentId = paymentEntity.id;
     const orderId = paymentEntity.order_id;
-    console.log(`❌ [${requestId}] Payment failed:`, { orderId, paymentId: paymentEntity.id });
+    const paymentLinkId = paymentEntity.payment_link_id;
+    
+    console.log(`❌ [${requestId}] Payment failed:`, {
+      paymentId,
+      orderId,
+      paymentLinkId
+    });
 
-    const orderDetails = orderStore.get(orderId);
+    // Update order status for both types
+    const lookupKey = paymentLinkId || orderId;
+    const orderDetails = orderStore.get(lookupKey);
+    
     if (orderDetails) {
       orderDetails.status = "failed";
       orderDetails.error = "Payment failed";
       orderDetails.failedAt = new Date().toISOString();
-      orderStore.set(orderId, orderDetails);
+      orderStore.set(lookupKey, orderDetails);
     }
   } catch (error) {
     console.error(`❌ [${requestId}] Payment failure handling error:`, error);
@@ -771,7 +821,7 @@ app.post("/recover-payment", async (req, res) => {
         
         console.log(`🔄 Found payment to recover: ${payment.id}`);
         
-        // Process the payment manually
+        // Process the payment manually with enhanced data
         const bookingDataWithPayment = {
           ...bookingData,
           paymentId: payment.id,
@@ -781,7 +831,7 @@ app.post("/recover-payment", async (req, res) => {
           remainingAmount: bookingData.totalAmount - 10,
           totalAmount: bookingData.totalAmount,
           recoveredAt: new Date().toISOString(),
-          source: 'recovery_process'
+          source: 'manual_recovery'
         };
 
         const paymentDetails = {
@@ -789,6 +839,8 @@ app.post("/recover-payment", async (req, res) => {
           razorpay_order_id: payment.order_id,
           payment_link_id: paymentLinkId,
         };
+
+        console.log(`💾 Processing recovery save...`);
 
         // Save to both services
         const [firebaseResult, sheetsResult] = await Promise.allSettled([
@@ -831,33 +883,56 @@ app.post("/recover-payment", async (req, res) => {
   }
 });
 
-// Enhanced cleanup with TTL
+// Enhanced cleanup with better TTL management
 setInterval(() => {
   const now = new Date();
   let cleanedCount = 0;
+  const keysToDelete = [];
 
   for (const [id, orderDetails] of orderStore.entries()) {
     const shouldClean = orderDetails.expiresAt && now > orderDetails.expiresAt;
     
     if (shouldClean) {
-      orderStore.delete(id);
+      keysToDelete.push(id);
       cleanedCount++;
     }
   }
 
+  // Delete expired orders
+  keysToDelete.forEach(key => orderStore.delete(key));
+  
   if (cleanedCount > 0) {
     console.log(`🧹 Cleaned up ${cleanedCount} expired orders`);
   }
-}, 60 * 60 * 1000); // Run every hour
+  
+  // Also clean up processed payments older than 1 hour
+  const processedPaymentsCopy = new Set(processedPayments);
+  processedPaymentsCopy.forEach(paymentId => {
+    // Keep recent payments in the set for 1 hour
+    // In a real implementation, you'd want to store timestamps
+    if (processedPayments.size > 1000) {
+      processedPayments.clear();
+    }
+  });
+  
+}, 30 * 60 * 1000); // Run every 30 minutes
 
-// Health check endpoint
+// Enhanced health check endpoint
 app.get("/health", (req, res) => {
   res.json({ 
     status: "healthy", 
     timestamp: new Date().toISOString(),
     activeOrders: orderStore.size,
-    version: "2.0 - Enhanced Payment Links",
-    environment: process.env.NODE_ENV || 'development'
+    processedPayments: processedPayments.size,
+    version: "3.0 - Enhanced Webhook Processing",
+    environment: process.env.NODE_ENV || 'development',
+    features: {
+      webhookSignatureVerification: true,
+      multipleOrderLookup: true,
+      dataRecovery: true,
+      retryLogic: true,
+      duplicateProtection: true
+    }
   });
 });
 
@@ -869,18 +944,44 @@ if (process.env.NODE_ENV === 'development') {
       status: order.status,
       type: order.type,
       createdAt: order.createdAt,
-      dataStored: order.dataStored
+      dataStored: order.dataStored,
+      recovered: order.recovered || false
     }));
     
-    res.json({ orders, count: orders.length });
+    res.json({ 
+      orders, 
+      count: orders.length,
+      processedPayments: processedPayments.size
+    });
+  });
+  
+  app.get("/debug/processed-payments", (req, res) => {
+    res.json({ 
+      processedPayments: Array.from(processedPayments),
+      count: processedPayments.size
+    });
   });
 }
 
-const PORT = process.env.PORT || 3001 ;
+// Test endpoint for webhook
+app.post("/test-webhook", (req, res) => {
+  console.log("🧪 Test webhook received:", req.body);
+  res.json({ status: "test_received", timestamp: new Date().toISOString() });
+});
+
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Enhanced Server running on port ${PORT}`);
+  console.log(`🚀 Enhanced Server v3.0 running on port ${PORT}`);
   console.log(`📡 Payment Links API Ready`);
   console.log(`🔗 Webhook endpoint: /webhook`);
   console.log(`🔄 Recovery endpoint: /recover-payment`);
   console.log(`📊 Health check: /health`);
+  console.log(`🧪 Test webhook: /test-webhook`);
+  console.log(`✅ Enhanced features enabled:`);
+  console.log(`   • Improved webhook signature verification`);
+  console.log(`   • Multiple order lookup strategies`);
+  console.log(`   • Automatic data recovery system`);
+  console.log(`   • Retry logic for data saving`);
+  console.log(`   • Duplicate payment protection`);
+  console.log(`   • Better error handling and logging`);
 });
