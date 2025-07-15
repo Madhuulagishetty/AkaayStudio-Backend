@@ -312,7 +312,7 @@ app.post("/create-payment-link", async (req, res) => {
     
     // Enhanced payment link options
     const options = {
-      amount: amount * 100, // Convert to paise
+      amount: amount * 10, // Convert to paise
       currency: "INR",
       reference_id: referenceId,
       description: `Theater Booking - ${bookingData.bookingName || 'Customer'} (${bookingData.date || 'Date TBD'})`,
@@ -328,14 +328,12 @@ app.post("/create-payment-link", async (req, res) => {
       callback_url: `${process.env.FRONTEND_URL || 'https://birthday-backend-tau.vercel.app'}/payment-success`,
       callback_method: "get",
       notes: {
-        bookingData: JSON.stringify({
-          ...bookingData,
-          sessionId,
-          referenceId,
-          createdAt: new Date().toISOString()
-        }),
-        sessionId,
-        referenceId,
+        booking_name: (bookingData.bookingName || '').substring(0, 50),
+        session_id: sessionId,
+        reference_id: referenceId,
+        date: (bookingData.date || '').substring(0, 20),
+        people: String(bookingData.people || 0),
+        amount: String(amount),
         version: "3.0"
       }
     };
@@ -972,10 +970,37 @@ app.post("/recover-payment", async (req, res) => {
           sheetsError: saveResults[1].status === 'rejected' ? saveResults[1].reason?.message : null,
           firebaseData: saveResults[0].status === 'fulfilled' ? saveResults[0].value : null,
           sheetsData: saveResults[1].status === 'fulfilled' ? saveResults[1].value : null,
-          timestamp: new Date().toISOString(),
+        }
+      }
+      if (paymentLinkDetails && paymentLinkDetails.notes && paymentLinkDetails.notes.session_id) {
           recovered: true,
           requestId
-        };
+        // Try to recover from order store using session_id or reference_id
+        const sessionId = paymentLinkDetails.notes.session_id;
+        const referenceId = paymentLinkDetails.notes.reference_id;
+        
+        // Look for stored data using session_id or reference_id
+        let recoveredBookingData = null;
+        for (const [id, orderData] of orderStore.entries()) {
+          if (orderData.sessionId === sessionId || orderData.reference_id === referenceId) {
+            recoveredBookingData = orderData.bookingData;
+            break;
+          }
+        }
+        
+        if (!recoveredBookingData) {
+          // Create minimal booking data from notes
+          recoveredBookingData = {
+            bookingName: paymentLinkDetails.notes.booking_name || 'Customer',
+            date: paymentLinkDetails.notes.date || '',
+            people: parseInt(paymentLinkDetails.notes.people) || 1,
+            totalAmount: parseFloat(paymentLinkDetails.notes.amount) * 10 || 100, // Estimate total
+            sessionId: sessionId,
+            reference_id: referenceId,
+            source: 'webhook_recovery_minimal',
+            recoveryNote: 'Recovered from minimal Razorpay notes data'
+          };
+        }
 
         // Update order store with recovered data
         addToOrderStore(paymentLinkId, {
@@ -1048,8 +1073,8 @@ setInterval(() => {
     const shouldClean = orderDetails.expiresAt && now > orderDetails.expiresAt;
     
     if (shouldClean) {
-      // Only clean if not recently paid
-      if (orderDetails.status !== "paid" || (now - new Date(orderDetails.processedAt || 0)) > 60 * 60 * 1000) {
+      // Only clean if not recently paid (keep paid orders for 2 hours for recovery)
+      if (orderDetails.status !== "paid" || (now - new Date(orderDetails.processedAt || 0)) > 2 * 60 * 60 * 1000) {
         orderStore.delete(id);
         cleanedCount++;
       }
@@ -1059,7 +1084,8 @@ setInterval(() => {
   if (cleanedCount > 0) {
     console.log(`🧹 Cleaned ${cleanedCount}/${totalCount} expired orders (${orderStore.size} remaining)`);
   }
-}, 30 * 60 * 1000); // Run every 30 minutes
+}
+)
 
 // Enhanced health check endpoint
 app.get("/health", (req, res) => {
