@@ -241,6 +241,51 @@ const validateAndSanitizePhone = (phone) => {
   return cleanPhone.length === 10 ? "91" + cleanPhone : cleanPhone;
 };
 
+// Enhanced data sanitization for Razorpay compatibility
+const sanitizeForRazorpay = (str) => {
+  if (!str) return "";
+  
+  return str
+    .toString()
+    .trim()
+    // Remove or replace problematic characters
+    .replace(/[^\x00-\x7F]/g, "") // Remove non-ASCII characters
+    .replace(/['"]/g, "") // Remove quotes
+    .replace(/[<>]/g, "") // Remove angle brackets
+    .replace(/[{}]/g, "") // Remove curly braces
+    .replace(/[\[\]]/g, "") // Remove square brackets
+    .replace(/[\\]/g, "") // Remove backslashes
+    .replace(/\s+/g, " ") // Replace multiple spaces with single space
+    .substring(0, 100); // Limit length to prevent issues
+};
+
+// Enhanced email validation and sanitization
+const sanitizeEmail = (email) => {
+  if (!email) return "";
+  
+  const cleanEmail = email
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w@.-]/g, ""); // Keep only alphanumeric, @, ., and -
+  
+  // Basic email validation
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(cleanEmail) ? cleanEmail : "";
+};
+
+// Enhanced name sanitization
+const sanitizeName = (name) => {
+  if (!name) return "Customer";
+  
+  return name
+    .toString()
+    .trim()
+    .replace(/[^\w\s.-]/g, "") // Keep only alphanumeric, spaces, dots, and hyphens
+    .replace(/\s+/g, " ") // Replace multiple spaces with single space
+    .substring(0, 50) // Limit to 50 characters
+    || "Customer"; // Fallback if empty after sanitization
+};
 // Enhanced payment link creation with better data storage
 app.post("/create-payment-link", async (req, res) => {
   try {
@@ -250,23 +295,42 @@ app.post("/create-payment-link", async (req, res) => {
       return res.status(400).json({ error: "Missing booking data or amount" });
     }
 
+    // Sanitize all input data before processing
+    const sanitizedBookingData = {
+      ...bookingData,
+      bookingName: sanitizeName(bookingData.bookingName),
+      NameUser: sanitizeName(bookingData.NameUser),
+      email: sanitizeEmail(bookingData.email),
+      address: sanitizeForRazorpay(bookingData.address),
+      occasion: sanitizeForRazorpay(bookingData.occasion),
+      whatsapp: validateAndSanitizePhone(bookingData.whatsapp)
+    };
+
     console.log("🔗 Creating payment link for booking:", {
-      name: bookingData.bookingName,
+      name: sanitizedBookingData.bookingName,
       amount: amount,
-      whatsapp: bookingData.whatsapp
+      whatsapp: sanitizedBookingData.whatsapp,
+      email: sanitizedBookingData.email
     });
 
-    const sanitizedPhone = validateAndSanitizePhone(bookingData.whatsapp);
+    const sanitizedPhone = sanitizedBookingData.whatsapp;
     const referenceId = "booking_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+    
+    // Sanitize data for Razorpay API
+    const sanitizedCustomerName = sanitizeName(sanitizedBookingData.bookingName);
+    const sanitizedEmail = sanitizeEmail(sanitizedBookingData.email);
+    const sanitizedDescription = sanitizeForRazorpay(
+      `Theater Booking - ${sanitizedCustomerName} - ${sanitizedBookingData.occasion || 'Celebration'}`
+    );
     
     const options = {
       amount: amount * 100, // Convert to paise
       currency: "INR",
       reference_id: referenceId,
-      description: `Theater Booking - ${bookingData.bookingName || 'Customer'} - ${bookingData.occasion || 'Celebration'}`,
+      description: sanitizedDescription,
       customer: {
-        name: bookingData.bookingName || "Customer",
-        email: bookingData.email || "",
+        name: sanitizedCustomerName,
+        email: sanitizedEmail,
       },
       notify: {
         sms: false,
@@ -275,12 +339,13 @@ app.post("/create-payment-link", async (req, res) => {
       reminder_enable: false,
       callback_url: `${process.env.FRONTEND_URL || 'https://birthday-backend-tau.vercel.app'}/payment-success`,
       callback_method: "get",
-      // Store minimal data in notes (under 255 chars)
+      // Store minimal sanitized data in notes (under 255 chars)
       notes: {
         ref_id: referenceId,
-        customer: bookingData.bookingName?.substring(0, 50) || 'Customer',
+        customer: sanitizedCustomerName.substring(0, 30),
         source: 'web_app',
-        amount: amount.toString()
+        amount: amount.toString(),
+        occasion: sanitizeForRazorpay(sanitizedBookingData.occasion || '').substring(0, 20)
       }
     };
 
@@ -289,14 +354,19 @@ app.post("/create-payment-link", async (req, res) => {
       options.customer.contact = sanitizedPhone;
     }
 
+    console.log("📋 Sanitized payment link options:", {
+      description: options.description,
+      customer: options.customer,
+      notes: options.notes
+    });
     const paymentLink = await razorpay.paymentLink.create(options);
     
     // Store enhanced booking data with expiration
     const enhancedBookingData = {
-      ...bookingData,
-      totalAmount: bookingData.totalAmount || bookingData.amountWithTax,
+      ...sanitizedBookingData,
+      totalAmount: sanitizedBookingData.totalAmount || sanitizedBookingData.amountWithTax,
       advanceAmount: amount,
-      remainingAmount: (bookingData.totalAmount || bookingData.amountWithTax) - amount,
+      remainingAmount: (sanitizedBookingData.totalAmount || sanitizedBookingData.amountWithTax) - amount,
       source: 'web_app',
       createdAt: new Date().toISOString(),
       reference_id: referenceId,
@@ -503,16 +573,27 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
             console.error(`❌ [${requestId}] Order not found even with reference ID: ${paymentLinkDetails.notes.ref_id}`);
             
             // Create minimal order details for basic processing
+            const sanitizedCustomerName = sanitizeName(paymentLinkDetails.notes.customer || 'Customer');
+            
             orderDetails = {
               bookingData: {
-                bookingName: paymentLinkDetails.notes.customer || 'Customer',
+                bookingName: sanitizedCustomerName,
+                NameUser: sanitizedCustomerName,
                 totalAmount: paymentLinkDetails.amount / 100,
                 advanceAmount: paymentLinkDetails.amount / 100,
                 remainingAmount: 0,
                 source: 'minimal_recovery',
                 recoveredAt: new Date().toISOString(),
                 paymentLinkId: paymentLinkId,
-                reference_id: paymentLinkDetails.reference_id
+                reference_id: paymentLinkDetails.reference_id,
+                occasion: sanitizeForRazorpay(paymentLinkDetails.notes.occasion || 'Celebration'),
+                email: '',
+                address: '',
+                whatsapp: '',
+                people: 1,
+                wantDecoration: 'Yes',
+                extraDecorations: [],
+                slotType: 'deluxe'
               },
               amount: paymentLinkDetails.amount / 100,
               status: "created",
@@ -844,11 +925,20 @@ app.post("/recover-payment", async (req, res) => {
         
         // Use provided booking data or create minimal data
         const recoveryBookingData = bookingData || {
-          bookingName: paymentLink.notes?.customer || 'Customer',
+          bookingName: sanitizeName(paymentLink.notes?.customer || 'Customer'),
+          NameUser: sanitizeName(paymentLink.notes?.customer || 'Customer'),
           totalAmount: paymentLink.amount / 100,
           advanceAmount: paymentLink.amount / 100,
           remainingAmount: 0,
-          source: 'recovery_minimal'
+          source: 'recovery_minimal',
+          occasion: sanitizeForRazorpay(paymentLink.notes?.occasion || 'Celebration'),
+          email: '',
+          address: '',
+          whatsapp: '',
+          people: 1,
+          wantDecoration: 'Yes',
+          extraDecorations: [],
+          slotType: 'deluxe'
         };
         
         // Process the payment manually with recovery data
