@@ -517,20 +517,90 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
   try {
     const orderId = paymentEntity.order_id;
     const paymentId = paymentEntity.id;
-    const orderDetails = orderStore.get(orderId);
+    const paymentLinkId = paymentEntity.payment_link_id;
+    
+    console.log(`💰 [${requestId}] Processing payment captured: ${paymentId}`);
+    console.log(`🔍 [${requestId}] Order ID: ${orderId}, Payment Link ID: ${paymentLinkId}`);
+    
+    let orderDetails = null;
+    let lookupKey = null;
+    
+    // First try to find by payment link ID (for payment links)
+    if (paymentLinkId) {
+      orderDetails = orderStore.get(paymentLinkId);
+      lookupKey = paymentLinkId;
+      console.log(`🔍 [${requestId}] Looking up by payment link ID: ${paymentLinkId}`);
+    }
+    
+    // If not found and we have order ID, try that (for regular orders)
+    if (!orderDetails && orderId) {
+      orderDetails = orderStore.get(orderId);
+      lookupKey = orderId;
+      console.log(`🔍 [${requestId}] Looking up by order ID: ${orderId}`);
+    }
     
     if (!orderDetails) {
-      console.log(`⚠️ [${requestId}] Order data not found: ${orderId}`);
+      console.log(`⚠️ [${requestId}] Order data not found for payment: ${paymentId}`);
+      console.log(`📋 [${requestId}] Available IDs:`, Array.from(orderStore.keys()));
+      
+      // Try to fetch payment link details from Razorpay API as fallback
+      if (paymentLinkId) {
+        try {
+          console.log(`🔄 [${requestId}] Attempting to fetch payment link details from Razorpay...`);
+          const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkId);
+          
+          if (paymentLinkDetails && paymentLinkDetails.notes) {
+            console.log(`✅ [${requestId}] Recovered booking data from Razorpay notes`);
+            const recoveredBookingData = JSON.parse(paymentLinkDetails.notes.bookingData || '{}');
+            
+            const bookingDataWithPayment = {
+              ...recoveredBookingData,
+              paymentId: paymentId,
+              orderId: orderId,
+              paymentLinkId: paymentLinkId,
+              advanceAmount: paymentLinkDetails.amount / 100,
+              webhookProcessedAt: new Date().toISOString(),
+              webhookRequestId: requestId,
+              source: 'webhook_recovery_captured'
+            };
+
+            const paymentDetails = {
+              razorpay_payment_id: paymentId,
+              razorpay_order_id: orderId,
+              payment_link_id: paymentLinkId,
+            };
+
+            // Save recovered data
+            const [firebaseResult, sheetsResult] = await Promise.allSettled([
+              saveToFirebase(bookingDataWithPayment, paymentDetails),
+              saveBookingToSheet(bookingDataWithPayment)
+            ]);
+
+            console.log(`✅ [${requestId}] Recovery save completed from payment.captured - Firebase: ${firebaseResult.status}, Sheets: ${sheetsResult.status}`);
+            return;
+          }
+        } catch (recoveryError) {
+          console.error(`❌ [${requestId}] Recovery attempt failed in payment.captured:`, recoveryError.message);
+        }
+      }
+      
       return;
     }
     
-    console.log(`💰 [${requestId}] Processing regular payment: ${paymentId}`);
+    // Prevent duplicate processing
+    if (orderDetails.status === "paid") {
+      console.log(`⚠️ [${requestId}] Payment already processed: ${lookupKey}`);
+      return;
+    }
     
-    // Similar processing logic as payment link
+    console.log(`💰 [${requestId}] Processing payment data for: ${lookupKey}`);
+    
+    // Prepare enhanced booking data
     const bookingDataWithPayment = {
       ...orderDetails.bookingData,
       paymentId: paymentId,
       orderId: orderId,
+      paymentLinkId: paymentLinkId,
       advanceAmount: orderDetails.amount,
       remainingAmount: orderDetails.bookingData.totalAmount - orderDetails.amount,
       totalAmount: orderDetails.bookingData.totalAmount,
@@ -541,8 +611,10 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
     const paymentDetails = {
       razorpay_payment_id: paymentId,
       razorpay_order_id: orderId,
-      razorpay_signature: "webhook_verified",
+      payment_link_id: paymentLinkId,
     };
+
+    console.log(`💾 [${requestId}] Saving data to Firebase and Sheets from payment.captured...`);
 
     // Save to both services
     const [firebaseResult, sheetsResult] = await Promise.allSettled([
@@ -550,23 +622,29 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       saveBookingToSheet(bookingDataWithPayment)
     ]);
 
-    // Update order status
-    orderDetails.status = "paid";
-    orderDetails.paymentId = paymentId;
-    orderDetails.dataStored = {
+    // Log detailed results
+    const dataStored = {
       firebase: firebaseResult.status === 'fulfilled',
       sheets: sheetsResult.status === 'fulfilled',
       firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
       sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
       timestamp: new Date().toISOString()
     };
+
+    console.log(`📊 [${requestId}] Data storage results from payment.captured:`, dataStored);
+
+    // Update order status
+    orderDetails.status = "paid";
+    orderDetails.paymentId = paymentId;
+    orderDetails.dataStored = dataStored;
     orderDetails.savedBooking = firebaseResult.status === 'fulfilled' ? firebaseResult.value : null;
     orderDetails.processedAt = new Date().toISOString();
-    orderStore.set(orderId, orderDetails);
+    orderDetails.webhookRequestId = requestId;
+    orderStore.set(lookupKey, orderDetails);
 
-    console.log(`✅ [${requestId}] Regular payment processed: ${paymentId}`);
+    console.log(`✅ [${requestId}] Payment captured processed successfully: ${paymentId}`);
   } catch (error) {
-    console.error(`❌ [${requestId}] Regular payment processing failed:`, error);
+    console.error(`❌ [${requestId}] Payment captured processing failed:`, error);
   }
 };
 
