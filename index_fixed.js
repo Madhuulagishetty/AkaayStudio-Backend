@@ -4,13 +4,13 @@ const axios = require("axios");
 const crypto = require("crypto");
 
 const firebaseConfig = {
-apiKey: "AIzaSyBh48b4J2mL4d9cGy8TBFE_3qiZL5NMnMY",
+  apiKey: "AIzaSyBh48b4J2mL4d9cGy8TBFE_3qiZL5NMnMY",
   authDomain: "birthday-fad86.firebaseapp.com",
   projectId: "birthday-fad86",
   storageBucket: "birthday-fad86.firebasestorage.app",
   messagingSenderId: "263994407282",
   appId: "1:263994407282:web:255bb7cf12025dfb3d05eb",
-  measurementId: "G-1MCR5CKGJ3"
+  measurementId: "G-1MCR5CKGJ3",
 };
 
 const firebaseApp = initializeApp(firebaseConfig);
