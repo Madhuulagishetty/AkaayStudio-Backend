@@ -33,15 +33,17 @@ if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
 }
 
 const app = express();
-app.use(express.json());
-
 
 // Enhanced middleware with better error handling
 app.use(cors());
 
-// Raw body parser for webhook
-app.use('/webhook', express.raw({ type: 'application/json' }));
-// JSON parser for other routes
+// Raw body parser specifically for webhook route (MUST come before JSON parser)
+app.use('/webhook', express.raw({ 
+  type: 'application/json',
+  limit: '10mb'
+}));
+
+// JSON parser for all other routes
 app.use(express.json({ limit: '10mb' }));
 
 // Initialize Razorpay
@@ -277,9 +279,20 @@ app.post("/create-payment-link", async (req, res) => {
 // Enhanced webhook signature verification
 const verifyWebhookSignature = (body, signature, secret) => {
   try {
+    // Ensure body is properly formatted for HMAC
+    let bodyString;
+    if (Buffer.isBuffer(body)) {
+      bodyString = body.toString('utf8');
+    } else if (typeof body === 'string') {
+      bodyString = body;
+    } else {
+      // If it's already parsed as JSON, stringify it
+      bodyString = JSON.stringify(body);
+    }
+
     const expectedSignature = crypto
       .createHmac("sha256", secret)
-      .update(body)
+      .update(bodyString, 'utf8')
       .digest("hex");
 
     return crypto.timingSafeEqual(
@@ -292,7 +305,7 @@ const verifyWebhookSignature = (body, signature, secret) => {
   }
 };
 
-// Enhanced webhook handler
+// Enhanced webhook handler with proper raw body handling
 app.post("/webhook", async (req, res) => {
   const startTime = Date.now();
   const requestId = Math.random().toString(36).substr(2, 9);
@@ -302,6 +315,7 @@ app.post("/webhook", async (req, res) => {
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
 
     console.log(`🔔 [${requestId}] Webhook received at ${new Date().toISOString()}`);
+    console.log(`🔍 [${requestId}] Body type: ${typeof req.body}, isBuffer: ${Buffer.isBuffer(req.body)}`);
     
     if (!webhookSecret) {
       console.error(`❌ [${requestId}] Webhook secret not configured`);
@@ -313,7 +327,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(400).json({ error: "Missing webhook signature" });
     }
 
-    // Verify webhook signature
+    // Verify webhook signature using raw body
     const isValidSignature = verifyWebhookSignature(
       req.body,
       webhookSignature,
@@ -322,10 +336,21 @@ app.post("/webhook", async (req, res) => {
 
     if (!isValidSignature) {
       console.error(`❌ [${requestId}] Invalid webhook signature`);
+      console.log(`🔍 [${requestId}] Signature: ${webhookSignature}`);
+      console.log(`🔍 [${requestId}] Body preview: ${Buffer.isBuffer(req.body) ? req.body.toString('utf8').substring(0, 100) + '...' : JSON.stringify(req.body).substring(0, 100) + '...'}`);
       return res.status(400).json({ error: "Invalid signature" });
     }
 
-    const event = JSON.parse(req.body);
+    // Parse the event from raw body
+    let event;
+    if (Buffer.isBuffer(req.body)) {
+      event = JSON.parse(req.body.toString('utf8'));
+    } else if (typeof req.body === 'string') {
+      event = JSON.parse(req.body);
+    } else {
+      event = req.body; // Already parsed
+    }
+    
     console.log(`🔔 [${requestId}] Event: ${event.event}`);
 
     // Handle different event types
