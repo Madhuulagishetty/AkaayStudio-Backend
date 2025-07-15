@@ -33,12 +33,11 @@ if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
 }
 
 const app = express();
+app.use(express.json());
+
 
 // Enhanced middleware with better error handling
-app.use(cors({
-  origin: process.env.FRONTEND_URL || ['http://localhost:3000', 'http://localhost:5176', 'http://localhost:4173'],
-  credentials: true
-}));
+app.use(cors());
 
 // Raw body parser for webhook
 app.use('/webhook', express.raw({ type: 'application/json' }));
