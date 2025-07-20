@@ -1,5 +1,3 @@
-// run `node index.js` in the terminal
-
 const { initializeApp } = require("firebase/app");
 const { getFirestore, collection, addDoc } = require("firebase/firestore");
 const axios = require("axios");
@@ -54,9 +52,77 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Enhanced order store with persistence
+// 🎯 ENHANCED DUPLICATE PREVENTION SYSTEM
 const orderStore = new Map();
-const processedPayments = new Set(); // Track processed payments to avoid duplicates
+const processedPayments = new Map(); // Changed to Map to store timestamps
+const duplicateAttempts = new Map(); // Track duplicate attempts for monitoring
+
+// 🎯 CRITICAL: Enhanced duplicate tracking with multiple strategies
+const markAsProcessed = (paymentId, paymentLinkId = null, context = 'unknown') => {
+  const timestamp = new Date().toISOString();
+  
+  // Mark payment ID
+  processedPayments.set(paymentId, {
+    timestamp,
+    context,
+    paymentLinkId
+  });
+  
+  // Mark payment link ID if available
+  if (paymentLinkId) {
+    const paymentLinkKey = `plink_${paymentLinkId}`;
+    processedPayments.set(paymentLinkKey, {
+      timestamp,
+      context,
+      paymentId
+    });
+  }
+  
+  console.log(`🔒 Marked as processed: ${paymentId} (${context})`);
+  if (paymentLinkId) {
+    console.log(`🔒 Marked payment link as processed: ${paymentLinkId} (${context})`);
+  }
+};
+
+// 🎯 CRITICAL: Check if payment was already processed
+const isAlreadyProcessed = (paymentId, paymentLinkId = null) => {
+  // Check payment ID
+  if (processedPayments.has(paymentId)) {
+    const info = processedPayments.get(paymentId);
+    console.log(`⚠️ DUPLICATE DETECTED: Payment ${paymentId} already processed at ${info.timestamp} (${info.context})`);
+    return true;
+  }
+  
+  // Check payment link ID
+  if (paymentLinkId) {
+    const paymentLinkKey = `plink_${paymentLinkId}`;
+    if (processedPayments.has(paymentLinkKey)) {
+      const info = processedPayments.get(paymentLinkKey);
+      console.log(`⚠️ DUPLICATE DETECTED: Payment link ${paymentLinkId} already processed at ${info.timestamp} (${info.context})`);
+      return true;
+    }
+  }
+  
+  return false;
+};
+
+// 🎯 CRITICAL: Track duplicate attempts for monitoring
+const trackDuplicateAttempt = (paymentId, paymentLinkId, context) => {
+  const key = paymentLinkId ? `${paymentId}_${paymentLinkId}` : paymentId;
+  
+  if (!duplicateAttempts.has(key)) {
+    duplicateAttempts.set(key, []);
+  }
+  
+  duplicateAttempts.get(key).push({
+    timestamp: new Date().toISOString(),
+    context,
+    paymentId,
+    paymentLinkId
+  });
+  
+  console.log(`📊 Duplicate attempt #${duplicateAttempts.get(key).length} for ${key} (${context})`);
+};
 
 // Enhanced Google Sheets saving with retry logic
 const saveBookingToSheet = async (bookingData, retryCount = 0) => {
@@ -115,14 +181,17 @@ const saveBookingToSheet = async (bookingData, retryCount = 0) => {
       created_at: bookingData.createdAt || isoTimestamp,
       webhook_processed: true,
       webhook_timestamp: isoTimestamp,
-      recovery_type: bookingData.minimal ? 'minimal' : bookingData.recovered ? 'recovered' : 'normal'
+      recovery_type: bookingData.minimal ? 'minimal' : bookingData.recovered ? 'recovered' : 'normal',
+      duplicate_prevention_version: '4.0', // 🎯 NEW: Track version for monitoring
+      save_context: bookingData.saveContext || 'webhook' // 🎯 NEW: Track save source
     };
 
     console.log("📊 Sheet data prepared:", {
       booking_date: sheetData.booking_date,
       payment_id: sheetData.payment_id,
       total_amount: sheetData.total_amount,
-      whatsapp_number: sheetData.whatsapp_number
+      whatsapp_number: sheetData.whatsapp_number,
+      save_context: sheetData.save_context
     });
 
     const response = await axios.post(
@@ -189,13 +258,16 @@ const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
       webhookProcessed: true,
       webhookTimestamp: new Date(),
       recoveryType: bookingData.minimal ? 'minimal' : bookingData.recovered ? 'recovered' : 'normal',
+      duplicatePreventionVersion: '4.0', // 🎯 NEW: Track version for monitoring
+      saveContext: bookingData.saveContext || 'webhook', // 🎯 NEW: Track save source
       bookingMeta: {
         createdAt: new Date(),
         source: "web",
-        version: "3.3",
+        version: "4.0",
         paymentMethod: "razorpay_payment_link",
         webhookProcessed: true,
-        processedAt: new Date().toISOString()
+        processedAt: new Date().toISOString(),
+        duplicatePreventionActive: true
       },
     };
 
@@ -203,7 +275,8 @@ const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
       bookingName: saveData.bookingName,
       paymentId: saveData.paymentId,
       totalAmount: saveData.totalAmount,
-      whatsapp: saveData.whatsapp
+      whatsapp: saveData.whatsapp,
+      saveContext: saveData.saveContext
     });
 
     const collectionName = bookingData.slotType || 'bookings';
@@ -285,7 +358,93 @@ const sanitizeName = (name) => {
     || "Customer"; // Fallback if empty after sanitization
 };
 
-// MODIFIED: Payment link creation WITHOUT immediate data save
+// 🎯 CRITICAL: Enhanced single data save function with duplicate prevention
+const saveBookingDataOnce = async (bookingData, paymentDetails, requestId, context = 'webhook') => {
+  const paymentId = paymentDetails.razorpay_payment_id;
+  const paymentLinkId = paymentDetails.payment_link_id;
+  
+  // 🎯 CRITICAL: Check for duplicates BEFORE any processing
+  if (isAlreadyProcessed(paymentId, paymentLinkId)) {
+    trackDuplicateAttempt(paymentId, paymentLinkId, context);
+    console.log(`🚫 [${requestId}] DUPLICATE SAVE PREVENTED for payment: ${paymentId} (${context})`);
+    return {
+      status: 'duplicate_prevented',
+      message: 'Data already saved - duplicate prevented',
+      paymentId,
+      paymentLinkId,
+      originalContext: processedPayments.get(paymentId)?.context || 'unknown'
+    };
+  }
+  
+  // 🎯 CRITICAL: Mark as processing IMMEDIATELY to prevent race conditions
+  markAsProcessed(paymentId, paymentLinkId, context);
+  
+  try {
+    console.log(`💾 [${requestId}] 🎯 SINGLE DATA SAVE: Starting for payment ${paymentId} (${context})...`);
+    
+    // Add save context to booking data
+    const enhancedBookingData = {
+      ...bookingData,
+      saveContext: context,
+      savedAt: new Date().toISOString(),
+      requestId
+    };
+    
+    // Save to both services with enhanced error handling
+    const [firebaseResult, sheetsResult] = await Promise.allSettled([
+      saveToFirebase(enhancedBookingData, paymentDetails),
+      saveBookingToSheet(enhancedBookingData)
+    ]);
+
+    // Log detailed results
+    const dataStored = {
+      firebase: firebaseResult.status === 'fulfilled',
+      sheets: sheetsResult.status === 'fulfilled',
+      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
+      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
+      timestamp: new Date().toISOString(),
+      context,
+      paymentId,
+      paymentLinkId,
+      requestId
+    };
+
+    console.log(`📊 [${requestId}] 🎯 SINGLE SAVE RESULTS (${context}):`, dataStored);
+
+    if (dataStored.firebase && dataStored.sheets) {
+      console.log(`✅ [${requestId}] 🎯 SINGLE SAVE SUCCESS: Data saved to both Firebase and Sheets (${context})`);
+    } else if (dataStored.firebase || dataStored.sheets) {
+      console.log(`⚠️ [${requestId}] 🎯 SINGLE SAVE PARTIAL: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only (${context})`);
+    } else {
+      console.log(`❌ [${requestId}] 🎯 SINGLE SAVE FAILURE: Data not saved to either service (${context})`);
+      // Remove from processed set if save failed completely
+      processedPayments.delete(paymentId);
+      if (paymentLinkId) {
+        processedPayments.delete(`plink_${paymentLinkId}`);
+      }
+    }
+    
+    return {
+      status: dataStored.firebase && dataStored.sheets ? 'success' : 
+              dataStored.firebase || dataStored.sheets ? 'partial' : 'failed',
+      dataStored,
+      savedBooking: firebaseResult.status === 'fulfilled' ? firebaseResult.value : null
+    };
+    
+  } catch (error) {
+    console.error(`❌ [${requestId}] Single data save failed (${context}):`, error);
+    
+    // Remove from processed set if save failed
+    processedPayments.delete(paymentId);
+    if (paymentLinkId) {
+      processedPayments.delete(`plink_${paymentLinkId}`);
+    }
+    
+    throw error;
+  }
+};
+
+// Payment link creation WITHOUT immediate data save
 app.post("/create-payment-link", async (req, res) => {
   try {
     const { amount, bookingData } = req.body;
@@ -427,7 +586,7 @@ const verifyWebhookSignature = (body, signature, secret) => {
   }
 };
 
-// CRITICAL: Enhanced webhook handler with better error handling
+// 🎯 CRITICAL: Enhanced webhook handler with ultimate duplicate prevention
 app.post("/webhook", async (req, res) => {
   const startTime = Date.now();
   const requestId = Math.random().toString(36).substr(2, 9);
@@ -476,14 +635,20 @@ app.post("/webhook", async (req, res) => {
       entity: event.payload?.payment?.entity?.id || event.payload?.payment_link?.entity?.id || 'Unknown'
     });
 
-    // Handle different event types
+    // 🎯 CRITICAL: Handle only payment_link.paid events to prevent duplicates
     switch (event.event) {
       case "payment_link.paid":
         await handlePaymentLinkPaid(event.payload.payment_link.entity, event.payload.payment.entity, requestId);
         break;
         
       case "payment.captured":
-        await handlePaymentCaptured(event.payload.payment.entity, requestId);
+        // 🎯 CRITICAL: Only handle if NOT a payment link payment
+        const paymentEntity = event.payload.payment.entity;
+        if (!paymentEntity.payment_link_id) {
+          await handlePaymentCaptured(paymentEntity, requestId);
+        } else {
+          console.log(`ℹ️ [${requestId}] Skipping payment.captured for payment link payment: ${paymentEntity.id}`);
+        }
         break;
         
       case "payment.failed":
@@ -512,7 +677,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// MODIFIED: Enhanced payment link handler - ONLY SAVE DATA HERE (SINGLE TIME)
+// 🎯 CRITICAL: Enhanced payment link handler - SINGLE DATA SAVE ONLY
 const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId) => {
   try {
     const paymentLinkId = paymentLinkEntity.id;
@@ -520,22 +685,12 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
     
     console.log(`🔍 [${requestId}] Processing payment link: ${paymentLinkId} with payment: ${paymentId}`);
     
-    // CRITICAL: Prevent duplicate processing - check both payment ID and payment link ID
-    if (processedPayments.has(paymentId)) {
-      console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
+    // 🎯 CRITICAL: Check for duplicates with enhanced tracking
+    if (isAlreadyProcessed(paymentId, paymentLinkId)) {
+      trackDuplicateAttempt(paymentId, paymentLinkId, 'payment_link.paid');
+      console.log(`🚫 [${requestId}] DUPLICATE PREVENTED: Payment link ${paymentLinkId} already processed`);
       return;
     }
-    
-    // Also check if this payment link was already processed
-    const paymentLinkKey = `plink_${paymentLinkId}`;
-    if (processedPayments.has(paymentLinkKey)) {
-      console.log(`⚠️ [${requestId}] Payment link already processed: ${paymentLinkId}`);
-      return;
-    }
-    
-    // Mark both payment ID and payment link ID as processing
-    processedPayments.add(paymentId);
-    processedPayments.add(paymentLinkKey);
     
     // Try to find order details with multiple lookup strategies
     let orderDetails = null;
@@ -652,36 +807,24 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
       payment_link_id: paymentLinkId,
     };
 
-    console.log(`💾 [${requestId}] 🎯 SINGLE DATA SAVE: Saving to Firebase and Sheets (ONLY TIME)...`);
-    console.log(`📊 [${requestId}] Booking data summary:`, {
-      bookingName: bookingDataWithPayment.bookingName,
-      paymentId: paymentId,
-      totalAmount: bookingDataWithPayment.totalAmount,
-      advanceAmount: bookingDataWithPayment.advanceAmount
-    });
+    // 🎯 CRITICAL: Single data save with enhanced duplicate prevention
+    const saveResult = await saveBookingDataOnce(
+      bookingDataWithPayment, 
+      paymentDetails, 
+      requestId, 
+      'payment_link.paid'
+    );
 
-    // Save to both services with enhanced error handling (SINGLE TIME SAVE)
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
-      saveToFirebase(bookingDataWithPayment, paymentDetails),
-      saveBookingToSheet(bookingDataWithPayment)
-    ]);
-
-    // Log detailed results
-    const dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
-    };
-
-    console.log(`📊 [${requestId}] 🎯 SINGLE SAVE RESULTS:`, dataStored);
+    if (saveResult.status === 'duplicate_prevented') {
+      console.log(`🚫 [${requestId}] Duplicate save prevented for payment link: ${paymentLinkId}`);
+      return;
+    }
 
     // Update order status
     orderDetails.status = "paid";
     orderDetails.paymentEntity = paymentEntity;
-    orderDetails.dataStored = dataStored;
-    orderDetails.savedBooking = firebaseResult.status === 'fulfilled' ? firebaseResult.value : null;
+    orderDetails.dataStored = saveResult.dataStored;
+    orderDetails.savedBooking = saveResult.savedBooking;
     orderDetails.processedAt = new Date().toISOString();
     orderDetails.webhookRequestId = requestId;
     
@@ -692,80 +835,21 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
     }
     
     // Log success
-    if (dataStored.firebase && dataStored.sheets) {
-      console.log(`✅ [${requestId}] 🎯 SINGLE SAVE SUCCESS: Data saved to both Firebase and Sheets (ONE TIME ONLY)`);
-    } else if (dataStored.firebase || dataStored.sheets) {
-      console.log(`⚠️ [${requestId}] 🎯 SINGLE SAVE PARTIAL: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+    if (saveResult.status === 'success') {
+      console.log(`✅ [${requestId}] 🎯 SINGLE SAVE SUCCESS: Data saved to both Firebase and Sheets (payment_link.paid)`);
+    } else if (saveResult.status === 'partial') {
+      console.log(`⚠️ [${requestId}] 🎯 SINGLE SAVE PARTIAL: Data saved partially (payment_link.paid)`);
     } else {
-      console.log(`❌ [${requestId}] 🎯 SINGLE SAVE FAILURE: Data not saved to either service`);
+      console.log(`❌ [${requestId}] 🎯 SINGLE SAVE FAILURE: Data not saved (payment_link.paid)`);
     }
     
     console.log(`✅ [${requestId}] Payment link processing completed`);
   } catch (error) {
     console.error(`❌ [${requestId}] Payment link processing failed:`, error);
-    processedPayments.delete(paymentEntity.id); // Remove from processed set on error
-    
-    // Enhanced error handling: Try to save minimal data even if processing fails
-    try {
-      console.log(`🔧 [${requestId}] Attempting minimal data save for failed webhook processing...`);
-      
-      const minimalBookingData = {
-        paymentId: paymentEntity.id,
-        orderId: paymentEntity.order_id,
-        paymentLinkId: paymentLinkEntity.id,
-        totalAmount: paymentEntity.amount / 100,
-        advanceAmount: paymentEntity.amount / 100,
-        remainingAmount: 0,
-        source: 'webhook_error_recovery',
-        errorRecoveryAt: new Date().toISOString(),
-        originalError: error.message,
-        paymentStatus: "paid_but_processing_failed",
-        bookingName: 'Webhook Error Recovery',
-        NameUser: 'Webhook Error Recovery',
-        email: '',
-        address: '',
-        whatsapp: '',
-        people: 1,
-        wantDecoration: 'Yes',
-        extraDecorations: [],
-        slotType: 'deluxe',
-        occasion: 'Special Event'
-      };
-
-      const minimalPaymentDetails = {
-        razorpay_payment_id: paymentEntity.id,
-        razorpay_order_id: paymentEntity.order_id,
-        payment_link_id: paymentLinkEntity.id,
-      };
-
-      // Try to save minimal data
-      const [firebaseResult, sheetsResult] = await Promise.allSettled([
-        saveToFirebase(minimalBookingData, minimalPaymentDetails),
-        saveBookingToSheet(minimalBookingData)
-      ]);
-
-      const errorRecoveryResults = {
-        firebase: firebaseResult.status === 'fulfilled',
-        sheets: sheetsResult.status === 'fulfilled',
-        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-        timestamp: new Date().toISOString()
-      };
-
-      console.log(`📊 [${requestId}] Error recovery data save results:`, errorRecoveryResults);
-
-      if (errorRecoveryResults.firebase || errorRecoveryResults.sheets) {
-        console.log(`✅ [${requestId}] ERROR RECOVERY SUCCESS: Minimal data saved to prevent complete loss`);
-      } else {
-        console.log(`❌ [${requestId}] ERROR RECOVERY FAILED: Unable to save even minimal data`);
-      }
-    } catch (recoveryError) {
-      console.error(`❌ [${requestId}] Error recovery also failed:`, recoveryError);
-    }
   }
 };
 
-// Enhanced payment captured handler
+// Enhanced payment captured handler (for non-payment-link payments only)
 const handlePaymentCaptured = async (paymentEntity, requestId) => {
   try {
     const paymentId = paymentEntity.id;
@@ -778,34 +862,14 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       paymentLinkId
     });
     
-    // CRITICAL: Prevent duplicate processing
-    if (processedPayments.has(paymentId)) {
-      console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
+    // 🎯 CRITICAL: Check for duplicates
+    if (isAlreadyProcessed(paymentId, paymentLinkId)) {
+      trackDuplicateAttempt(paymentId, paymentLinkId, 'payment.captured');
+      console.log(`🚫 [${requestId}] DUPLICATE PREVENTED: Payment ${paymentId} already processed`);
       return;
     }
     
-    // If this is a payment link payment, it should be handled by payment_link.paid event
-    if (paymentLinkId) {
-      console.log(`ℹ️ [${requestId}] Payment link payment detected - checking if already processed by payment_link.paid event`);
-      
-      // Check if payment link was already processed
-      const paymentLinkKey = `plink_${paymentLinkId}`;
-      if (processedPayments.has(paymentLinkKey)) {
-        console.log(`✅ [${requestId}] Payment link already processed by payment_link.paid event - skipping payment.captured`);
-        return;
-      }
-      
-      console.log(`⚠️ [${requestId}] Payment link not yet processed - will process via payment.captured as fallback`);
-    }
-    
-    // Mark as processing
-    processedPayments.add(paymentId);
-    if (paymentLinkId) {
-      const paymentLinkKey = `plink_${paymentLinkId}`;
-      processedPayments.add(paymentLinkKey);
-    }
-    
-    // Handle regular order payments
+    // Handle regular order payments only
     let orderDetails = null;
     
     if (orderId) {
@@ -817,7 +881,7 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       return;
     }
     
-    // Process regular payment (similar to payment link handling)
+    // Process regular payment
     const bookingDataWithPayment = {
       ...orderDetails.bookingData,
       paymentId: paymentId,
@@ -836,92 +900,29 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       payment_link_id: paymentLinkId,
     };
 
-    console.log(`💾 [${requestId}] Saving regular payment data...`);
+    // 🎯 CRITICAL: Single data save with enhanced duplicate prevention
+    const saveResult = await saveBookingDataOnce(
+      bookingDataWithPayment, 
+      paymentDetails, 
+      requestId, 
+      'payment.captured'
+    );
 
-    // Save to both services
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
-      saveToFirebase(bookingDataWithPayment, paymentDetails),
-      saveBookingToSheet(bookingDataWithPayment)
-    ]);
-
-    const dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
-    };
-
-    console.log(`📊 [${requestId}] Regular payment data storage results:`, dataStored);
+    if (saveResult.status === 'duplicate_prevented') {
+      console.log(`🚫 [${requestId}] Duplicate save prevented for regular payment: ${paymentId}`);
+      return;
+    }
 
     // Update order status
     orderDetails.status = "paid";
     orderDetails.paymentId = paymentId;
-    orderDetails.dataStored = dataStored;
+    orderDetails.dataStored = saveResult.dataStored;
     orderDetails.processedAt = new Date().toISOString();
     orderStore.set(orderId, orderDetails);
 
     console.log(`✅ [${requestId}] Regular payment processing completed`);
   } catch (error) {
     console.error(`❌ [${requestId}] Payment captured processing failed:`, error);
-    processedPayments.delete(paymentEntity.id); // Remove from processed set on error
-    
-    // Enhanced error handling for regular payments
-    try {
-      console.log(`🔧 [${requestId}] Attempting minimal data save for failed regular payment processing...`);
-      
-      const minimalBookingData = {
-        paymentId: paymentEntity.id,
-        orderId: paymentEntity.order_id,
-        totalAmount: paymentEntity.amount / 100,
-        advanceAmount: paymentEntity.amount / 100,
-        remainingAmount: 0,
-        source: 'regular_payment_error_recovery',
-        errorRecoveryAt: new Date().toISOString(),
-        originalError: error.message,
-        paymentStatus: "paid_but_processing_failed",
-        bookingName: 'Regular Payment Error Recovery',
-        NameUser: 'Regular Payment Error Recovery',
-        email: '',
-        address: '',
-        whatsapp: '',
-        people: 1,
-        wantDecoration: 'Yes',
-        extraDecorations: [],
-        slotType: 'deluxe',
-        occasion: 'Special Event'
-      };
-
-      const minimalPaymentDetails = {
-        razorpay_payment_id: paymentEntity.id,
-        razorpay_order_id: paymentEntity.order_id,
-        payment_link_id: null,
-      };
-
-      // Try to save minimal data
-      const [firebaseResult, sheetsResult] = await Promise.allSettled([
-        saveToFirebase(minimalBookingData, minimalPaymentDetails),
-        saveBookingToSheet(minimalBookingData)
-      ]);
-
-      const errorRecoveryResults = {
-        firebase: firebaseResult.status === 'fulfilled',
-        sheets: sheetsResult.status === 'fulfilled',
-        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-        timestamp: new Date().toISOString()
-      };
-
-      console.log(`📊 [${requestId}] Regular payment error recovery results:`, errorRecoveryResults);
-
-      if (errorRecoveryResults.firebase || errorRecoveryResults.sheets) {
-        console.log(`✅ [${requestId}] REGULAR PAYMENT ERROR RECOVERY SUCCESS: Minimal data saved`);
-      } else {
-        console.log(`❌ [${requestId}] REGULAR PAYMENT ERROR RECOVERY FAILED: Unable to save data`);
-      }
-    } catch (recoveryError) {
-      console.error(`❌ [${requestId}] Regular payment error recovery also failed:`, recoveryError);
-    }
   }
 };
 
@@ -1033,7 +1034,7 @@ app.get("/payment-status/:paymentId", async (req, res) => {
   }
 });
 
-// Backup data save endpoint for thank you page
+// 🎯 CRITICAL: Enhanced backup data save endpoint with strict duplicate prevention
 app.post("/save-backup-data", async (req, res) => {
   try {
     const { bookingData, paymentId, orderId } = req.body;
@@ -1044,27 +1045,45 @@ app.post("/save-backup-data", async (req, res) => {
     
     console.log(`💾 Backup data save requested for payment: ${paymentId}`);
     
-    // CRITICAL: Check if data was already saved by webhook (multiple checks)
-    if (processedPayments.has(paymentId)) {
-      console.log(`ℹ️ Payment ${paymentId} already processed by webhook - skipping backup save`);
+    const paymentLinkId = bookingData.paymentLinkId;
+    
+    // 🎯 CRITICAL: Check if data was already saved by webhook
+    if (isAlreadyProcessed(paymentId, paymentLinkId)) {
+      const existingInfo = processedPayments.get(paymentId) || processedPayments.get(`plink_${paymentLinkId}`);
+      console.log(`🚫 Backup save prevented - data already saved by ${existingInfo?.context || 'unknown'} at ${existingInfo?.timestamp || 'unknown time'}`);
       return res.json({ 
         status: "already_saved", 
-        message: "Data already saved by webhook",
-        skipped: true
+        message: `Data already saved by ${existingInfo?.context || 'webhook'}`,
+        skipped: true,
+        originalContext: existingInfo?.context,
+        originalTimestamp: existingInfo?.timestamp
       });
     }
     
-    // Also check for payment link processing
-    const paymentLinkId = bookingData.paymentLinkId;
-    if (paymentLinkId) {
-      const paymentLinkKey = `plink_${paymentLinkId}`;
-      if (processedPayments.has(paymentLinkKey)) {
-        console.log(`ℹ️ Payment link ${paymentLinkId} already processed by webhook - skipping backup save`);
-        return res.json({ 
-          status: "already_saved", 
-          message: "Data already saved by webhook (payment link)",
-          skipped: true
-        });
+    // 🎯 NEW: Additional check for payment link payments via Razorpay API
+    if (paymentLinkId && paymentLinkId.startsWith('plink_')) {
+      try {
+        console.log(`🔍 Checking payment link status before backup save...`);
+        const paymentLink = await razorpay.paymentLink.fetch(paymentLinkId);
+        
+        if (paymentLink.status === "paid") {
+          // Double-check if webhook might have processed it
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+          
+          if (isAlreadyProcessed(paymentId, paymentLinkId)) {
+            const existingInfo = processedPayments.get(paymentId) || processedPayments.get(`plink_${paymentLinkId}`);
+            console.log(`🚫 Backup save prevented after double-check - webhook processed during verification`);
+            return res.json({ 
+              status: "already_saved", 
+              message: "Data saved by webhook during verification",
+              skipped: true,
+              originalContext: existingInfo?.context,
+              originalTimestamp: existingInfo?.timestamp
+            });
+          }
+        }
+      } catch (apiError) {
+        console.error(`⚠️ Could not verify payment link status for backup save:`, apiError.message);
       }
     }
     
@@ -1080,55 +1099,48 @@ app.post("/save-backup-data", async (req, res) => {
     const paymentDetails = {
       razorpay_payment_id: paymentId,
       razorpay_order_id: orderId,
-      payment_link_id: null,
+      payment_link_id: paymentLinkId,
     };
 
     console.log(`🔄 Processing backup save for: ${bookingData.bookingName || 'Unknown'}`);
 
-    // Mark as processing to prevent future duplicates
-    processedPayments.add(paymentId);
-    if (paymentLinkId) {
-      const paymentLinkKey = `plink_${paymentLinkId}`;
-      processedPayments.add(paymentLinkKey);
+    // 🎯 CRITICAL: Use single data save function with backup context
+    const saveResult = await saveBookingDataOnce(
+      enhancedBookingData, 
+      paymentDetails, 
+      'backup_' + Date.now(), 
+      'thankyou_page_backup'
+    );
+
+    if (saveResult.status === 'duplicate_prevented') {
+      return res.json({ 
+        status: "already_saved", 
+        message: `Data already saved by ${saveResult.originalContext}`,
+        skipped: true,
+        originalContext: saveResult.originalContext
+      });
     }
 
-    // Save to both services with enhanced error handling
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
-      saveToFirebase(enhancedBookingData, paymentDetails),
-      saveBookingToSheet(enhancedBookingData)
-    ]);
-
-    // Log detailed results
-    const dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
-    };
-
-    console.log(`📊 Backup data storage results:`, dataStored);
-
-    if (dataStored.firebase && dataStored.sheets) {
+    if (saveResult.status === 'success') {
       console.log(`✅ BACKUP SUCCESS: Data saved to both Firebase and Sheets`);
       res.json({ 
         status: "success", 
         message: "Backup data saved successfully",
-        dataStored: dataStored
+        dataStored: saveResult.dataStored
       });
-    } else if (dataStored.firebase || dataStored.sheets) {
-      console.log(`⚠️ BACKUP PARTIAL: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+    } else if (saveResult.status === 'partial') {
+      console.log(`⚠️ BACKUP PARTIAL: Data saved partially`);
       res.json({ 
         status: "partial", 
         message: "Backup data partially saved",
-        dataStored: dataStored
+        dataStored: saveResult.dataStored
       });
     } else {
       console.log(`❌ BACKUP FAILED: Data not saved to either service`);
       res.status(500).json({ 
         status: "failed", 
         message: "Failed to save backup data",
-        dataStored: dataStored
+        dataStored: saveResult.dataStored
       });
     }
   } catch (error) {
@@ -1165,13 +1177,16 @@ app.post("/recover-payment", async (req, res) => {
         
         console.log(`🔄 Found payment to recover: ${payment.id}`);
         
-        // Check if already processed
-        if (processedPayments.has(payment.id)) {
-          console.log(`ℹ️ Payment ${payment.id} already processed - no recovery needed`);
+        // 🎯 CRITICAL: Check if already processed
+        if (isAlreadyProcessed(payment.id, paymentLinkId)) {
+          const existingInfo = processedPayments.get(payment.id) || processedPayments.get(`plink_${paymentLinkId}`);
+          console.log(`ℹ️ Payment ${payment.id} already processed by ${existingInfo?.context} - no recovery needed`);
           return res.json({ 
             status: "already_processed", 
-            message: "Payment already processed by webhook",
-            paymentId: payment.id
+            message: `Payment already processed by ${existingInfo?.context || 'webhook'}`,
+            paymentId: payment.id,
+            originalContext: existingInfo?.context,
+            originalTimestamp: existingInfo?.timestamp
           });
         }
         
@@ -1214,29 +1229,29 @@ app.post("/recover-payment", async (req, res) => {
 
         console.log(`💾 Processing recovery save...`);
 
-        // Save to both services
-        const [firebaseResult, sheetsResult] = await Promise.allSettled([
-          saveToFirebase(bookingDataWithPayment, paymentDetails),
-          saveBookingToSheet(bookingDataWithPayment)
-        ]);
-        
-        const dataStored = {
-          firebase: firebaseResult.status === 'fulfilled',
-          sheets: sheetsResult.status === 'fulfilled',
-          firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-          sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-          timestamp: new Date().toISOString()
-        };
+        // 🎯 CRITICAL: Use single data save function with recovery context
+        const saveResult = await saveBookingDataOnce(
+          bookingDataWithPayment, 
+          paymentDetails, 
+          'recovery_' + Date.now(), 
+          'manual_recovery'
+        );
 
-        // Mark as processed to avoid future duplicates
-        processedPayments.add(payment.id);
+        if (saveResult.status === 'duplicate_prevented') {
+          return res.json({ 
+            status: "already_processed", 
+            message: `Payment already processed by ${saveResult.originalContext}`,
+            paymentId: payment.id,
+            originalContext: saveResult.originalContext
+          });
+        }
 
-        console.log(`✅ Payment recovery completed:`, dataStored);
+        console.log(`✅ Payment recovery completed:`, saveResult);
         
         res.json({
           status: "recovered",
           paymentId: payment.id,
-          dataStored: dataStored
+          dataStored: saveResult.dataStored
         });
       } else {
         console.log(`⚠️ No payments found for payment link: ${paymentLinkId}`);
@@ -1280,15 +1295,32 @@ setInterval(() => {
     console.log(`🧹 Cleaned up ${cleanedCount} expired orders`);
   }
   
-  // Also clean up processed payments older than 1 hour
-  const processedPaymentsCopy = new Set(processedPayments);
-  processedPaymentsCopy.forEach(paymentId => {
-    // Keep recent payments in the set for 1 hour
-    // In a real implementation, you'd want to store timestamps
-    if (processedPayments.size > 1000) {
-      processedPayments.clear();
+  // Clean up processed payments older than 24 hours
+  const processedPaymentsCopy = new Map(processedPayments);
+  for (const [paymentId, info] of processedPaymentsCopy) {
+    const processedTime = new Date(info.timestamp);
+    const hoursDiff = (now - processedTime) / (1000 * 60 * 60);
+    
+    if (hoursDiff > 24) {
+      processedPayments.delete(paymentId);
     }
-  });
+  }
+  
+  // Clean up duplicate attempts older than 24 hours
+  const duplicateAttemptsCopy = new Map(duplicateAttempts);
+  for (const [key, attempts] of duplicateAttemptsCopy) {
+    const filteredAttempts = attempts.filter(attempt => {
+      const attemptTime = new Date(attempt.timestamp);
+      const hoursDiff = (now - attemptTime) / (1000 * 60 * 60);
+      return hoursDiff <= 24;
+    });
+    
+    if (filteredAttempts.length === 0) {
+      duplicateAttempts.delete(key);
+    } else {
+      duplicateAttempts.set(key, filteredAttempts);
+    }
+  }
   
 }, 30 * 60 * 1000); // Run every 30 minutes
 
@@ -1299,21 +1331,25 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     activeOrders: orderStore.size,
     processedPayments: processedPayments.size,
-    version: "3.3 - Enhanced Duplicate Prevention",
+    duplicateAttempts: duplicateAttempts.size,
+    version: "4.0 - Ultimate Duplicate Prevention",
     environment: process.env.NODE_ENV || 'development',
     features: {
       webhookSignatureVerification: true,
       multipleOrderLookup: true,
       dataRecovery: true,
       retryLogic: true,
-      enhancedDuplicateProtection: true,
-      immediateDataSave: false, // 🎯 DISABLED
-      singleDataSaveOnly: true, // 🎯 ENABLED
+      ultimateDuplicateProtection: true, // 🎯 ENHANCED
+      singleDataSaveOnly: true,
       backupDataEndpoint: true,
       thankyouPageBackup: true,
       webhookErrorRecovery: true,
-      webhookOnlyDataSave: true, // 🎯 NEW FEATURE
-      dualEventProtection: true // 🎯 NEW - Prevents both payment_link.paid and payment.captured from saving
+      webhookOnlyDataSave: true,
+      dualEventProtection: true,
+      enhancedDuplicateTracking: true, // 🎯 NEW
+      paymentIdTimestamps: true, // 🎯 NEW
+      contextualSaveTracking: true, // 🎯 NEW
+      duplicateAttemptMonitoring: true // 🎯 NEW
     }
   });
 });
@@ -1333,14 +1369,38 @@ if (process.env.NODE_ENV === 'development') {
     res.json({ 
       orders, 
       count: orders.length,
-      processedPayments: processedPayments.size
+      processedPayments: processedPayments.size,
+      duplicateAttempts: duplicateAttempts.size
     });
   });
   
+  // 🎯 NEW: Enhanced debug endpoint for processed payments
   app.get("/debug/processed-payments", (req, res) => {
+    const processed = Array.from(processedPayments.entries()).map(([id, info]) => ({
+      id,
+      timestamp: info.timestamp,
+      context: info.context,
+      paymentLinkId: info.paymentLinkId,
+      paymentId: info.paymentId
+    }));
+    
     res.json({ 
-      processedPayments: Array.from(processedPayments),
+      processedPayments: processed,
       count: processedPayments.size
+    });
+  });
+  
+  // 🎯 NEW: Debug endpoint for duplicate attempts
+  app.get("/debug/duplicate-attempts", (req, res) => {
+    const attempts = Array.from(duplicateAttempts.entries()).map(([key, attemptList]) => ({
+      key,
+      attempts: attemptList,
+      count: attemptList.length
+    }));
+    
+    res.json({ 
+      duplicateAttempts: attempts,
+      totalKeys: duplicateAttempts.size
     });
   });
 }
@@ -1353,24 +1413,25 @@ app.post("/test-webhook", (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Enhanced Server v3.3 running on port ${PORT}`);
+  console.log(`🚀 Enhanced Server v4.0 running on port ${PORT}`);
   console.log(`📡 Payment Links API Ready`);
   console.log(`🔗 Webhook endpoint: /webhook`);
   console.log(`🔄 Recovery endpoint: /recover-payment`);
   console.log(`💾 Backup data endpoint: /save-backup-data`);
   console.log(`📊 Health check: /health`);
   console.log(`🧪 Test webhook: /test-webhook`);
-  console.log(`✅ 🎯 ENHANCED DUPLICATE PREVENTION SYSTEM:`);
+  console.log(`✅ 🎯 ULTIMATE DUPLICATE PREVENTION SYSTEM v4.0:`);
   console.log(`   • ❌ DISABLED: Immediate data save on payment link creation`);
   console.log(`   • ✅ ENABLED: Single data save only via webhook after payment`);
-  console.log(`   • ✅ ENABLED: Dual event protection (payment_link.paid + payment.captured)`);
+  console.log(`   • ✅ ENABLED: Enhanced payment ID tracking with timestamps`);
   console.log(`   • ✅ ENABLED: Payment link ID tracking in processed payments`);
-  console.log(`   • ✅ ENABLED: Improved webhook signature verification`);
-  console.log(`   • ✅ ENABLED: Multiple order lookup strategies`);
-  console.log(`   • ✅ ENABLED: Automatic data recovery system`);
-  console.log(`   • ✅ ENABLED: Retry logic for data saving`);
-  console.log(`   • ✅ ENABLED: Enhanced duplicate payment protection`);
-  console.log(`   • ✅ ENABLED: Better error handling and logging`);
-  console.log(`   • 🎯 KEY CHANGE: Data saved EXACTLY ONCE when payment is completed`);
-  console.log(`   • 🎯 NEW: Prevents duplicate saves from multiple webhook events`);
+  console.log(`   • ✅ ENABLED: Contextual save tracking (webhook/backup/recovery)`);
+  console.log(`   • ✅ ENABLED: Duplicate attempt monitoring and logging`);
+  console.log(`   • ✅ ENABLED: Multiple duplicate prevention strategies`);
+  console.log(`   • ✅ ENABLED: Enhanced backup save duplicate prevention`);
+  console.log(`   • ✅ ENABLED: Recovery endpoint duplicate prevention`);
+  console.log(`   • ✅ ENABLED: Payment.captured event filtering for payment links`);
+  console.log(`   • 🎯 CRITICAL: Data saved EXACTLY ONCE when payment is completed`);
+  console.log(`   • 🎯 NEW: Ultimate duplicate prevention with Map-based tracking`);
+  console.log(`   • 🎯 NEW: Enhanced debug endpoints for monitoring duplicates`);
 });
