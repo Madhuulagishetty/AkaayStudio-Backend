@@ -394,14 +394,58 @@ app.post("/create-payment-link", async (req, res) => {
     console.log(`✅ Payment link created: ${paymentLink.id}`);
     console.log(`📦 Order data stored with keys: ${paymentLink.id}, ${referenceId}`);
 
-    // DATA STORAGE REMOVED: Will only save data after successful payment via webhook
-    console.log(`💾 Payment link created successfully. Data will be saved only after successful payment confirmation via webhook.`);
-    
-    // Store only order metadata (no actual booking data save)
-    orderData.webhookPending = true;
-    orderData.createdForWebhook = true;
-    orderStore.set(paymentLink.id, orderData);
-    orderStore.set(referenceId, orderData);
+    // IMMEDIATE DATA SAVE: Save booking data immediately when payment link is created
+    // This ensures data is not lost even if webhook fails
+    try {
+      console.log(`💾 Saving booking data immediately for payment link: ${paymentLink.id}`);
+      
+      const immediateBookingData = {
+        ...enhancedBookingData,
+        paymentLinkId: paymentLink.id,
+        immediatelyCreated: true,
+        immediatelyCreatedAt: new Date().toISOString(),
+        paymentStatus: "pending",
+        source: 'immediate_payment_link_creation'
+      };
+
+      const paymentDetails = {
+        razorpay_payment_id: null, // Will be updated when payment is made
+        razorpay_order_id: null,
+        payment_link_id: paymentLink.id,
+      };
+
+      // Save to both services immediately
+      const [firebaseResult, sheetsResult] = await Promise.allSettled([
+        saveToFirebase(immediateBookingData, paymentDetails),
+        saveBookingToSheet(immediateBookingData)
+      ]);
+
+      const immediateDataStored = {
+        firebase: firebaseResult.status === 'fulfilled',
+        sheets: sheetsResult.status === 'fulfilled',
+        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
+        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
+        timestamp: new Date().toISOString()
+      };
+
+      console.log(`📊 Immediate data storage results:`, immediateDataStored);
+
+      // Store the immediate save results
+      orderData.immediateDataStored = immediateDataStored;
+      orderStore.set(paymentLink.id, orderData);
+      orderStore.set(referenceId, orderData);
+
+      if (immediateDataStored.firebase && immediateDataStored.sheets) {
+        console.log(`✅ IMMEDIATE SAVE SUCCESS: Data saved to both Firebase and Sheets`);
+      } else if (immediateDataStored.firebase || immediateDataStored.sheets) {
+        console.log(`⚠️ IMMEDIATE SAVE PARTIAL: Data saved to ${immediateDataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+      } else {
+        console.log(`❌ IMMEDIATE SAVE FAILED: Data not saved to either service`);
+      }
+    } catch (immediateError) {
+      console.error(`❌ Immediate data save failed for payment link: ${paymentLink.id}`, immediateError);
+      // Don't fail the payment link creation if immediate save fails
+    }
     
     res.json({
       paymentLink,
@@ -1022,27 +1066,77 @@ app.get("/payment-status/:paymentId", async (req, res) => {
   }
 });
 
-// Backup data save endpoint for thank you page - DISABLED
-// This endpoint should not save data - webhook handles all data saving
+// Backup data save endpoint for thank you page
 app.post("/save-backup-data", async (req, res) => {
   try {
     const { bookingData, paymentId, orderId } = req.body;
     
-    console.log(`⚠️ Backup data save requested but DISABLED for payment: ${paymentId}`);
-    console.log(`📝 Data saving is handled by webhook only - no action taken`);
+    if (!bookingData) {
+      return res.status(400).json({ error: "Booking data required" });
+    }
     
-    // Return success without saving anything
-    res.json({ 
-      status: "success", 
-      message: "Data saving is handled by webhook - no backup needed",
-      webhookOnly: true,
+    console.log(`💾 Backup data save requested for payment: ${paymentId}`);
+    
+    // Ensure we have the payment details
+    const enhancedBookingData = {
+      ...bookingData,
+      paymentId: paymentId,
+      orderId: orderId,
+      backupSavedAt: new Date().toISOString(),
+      source: 'thankyou_page_backup'
+    };
+
+    const paymentDetails = {
+      razorpay_payment_id: paymentId,
+      razorpay_order_id: orderId,
+      payment_link_id: null,
+    };
+
+    console.log(`🔄 Processing backup save for: ${bookingData.bookingName || 'Unknown'}`);
+
+    // Save to both services with enhanced error handling
+    const [firebaseResult, sheetsResult] = await Promise.allSettled([
+      saveToFirebase(enhancedBookingData, paymentDetails),
+      saveBookingToSheet(enhancedBookingData)
+    ]);
+
+    // Log detailed results
+    const dataStored = {
+      firebase: firebaseResult.status === 'fulfilled',
+      sheets: sheetsResult.status === 'fulfilled',
+      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
+      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
       timestamp: new Date().toISOString()
-    });
-    
+    };
+
+    console.log(`📊 Backup data storage results:`, dataStored);
+
+    if (dataStored.firebase && dataStored.sheets) {
+      console.log(`✅ BACKUP SUCCESS: Data saved to both Firebase and Sheets`);
+      res.json({ 
+        status: "success", 
+        message: "Backup data saved successfully",
+        dataStored: dataStored
+      });
+    } else if (dataStored.firebase || dataStored.sheets) {
+      console.log(`⚠️ BACKUP PARTIAL: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+      res.json({ 
+        status: "partial", 
+        message: "Backup data partially saved",
+        dataStored: dataStored
+      });
+    } else {
+      console.log(`❌ BACKUP FAILED: Data not saved to either service`);
+      res.status(500).json({ 
+        status: "failed", 
+        message: "Failed to save backup data",
+        dataStored: dataStored
+      });
+    }
   } catch (error) {
-    console.error("❌ Backup endpoint error:", error);
+    console.error("❌ Backup data save failed:", error);
     res.status(500).json({ 
-      error: "Backup endpoint error", 
+      error: "Backup save failed", 
       details: error.message 
     });
   }
