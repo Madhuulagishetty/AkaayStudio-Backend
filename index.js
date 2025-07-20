@@ -1034,6 +1034,124 @@ app.get("/payment-status/:paymentId", async (req, res) => {
   }
 });
 
+// 🎯 CRITICAL: Enhanced backup data save endpoint with strict duplicate prevention
+app.post("/save-backup-data", async (req, res) => {
+  try {
+    const { bookingData, paymentId, orderId } = req.body;
+    
+    if (!bookingData) {
+      return res.status(400).json({ error: "Booking data required" });
+    }
+    
+    console.log(`💾 Backup data save requested for payment: ${paymentId}`);
+    
+    const paymentLinkId = bookingData.paymentLinkId;
+    
+    // 🎯 CRITICAL: Check if data was already saved by webhook
+    if (isAlreadyProcessed(paymentId, paymentLinkId)) {
+      const existingInfo = processedPayments.get(paymentId) || processedPayments.get(`plink_${paymentLinkId}`);
+      console.log(`🚫 Backup save prevented - data already saved by ${existingInfo?.context || 'unknown'} at ${existingInfo?.timestamp || 'unknown time'}`);
+      return res.json({ 
+        status: "already_saved", 
+        message: `Data already saved by ${existingInfo?.context || 'webhook'}`,
+        skipped: true,
+        originalContext: existingInfo?.context,
+        originalTimestamp: existingInfo?.timestamp
+      });
+    }
+    
+    // 🎯 NEW: Additional check for payment link payments via Razorpay API
+    if (paymentLinkId && paymentLinkId.startsWith('plink_')) {
+      try {
+        console.log(`🔍 Checking payment link status before backup save...`);
+        const paymentLink = await razorpay.paymentLink.fetch(paymentLinkId);
+        
+        if (paymentLink.status === "paid") {
+          // Double-check if webhook might have processed it
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+          
+          if (isAlreadyProcessed(paymentId, paymentLinkId)) {
+            const existingInfo = processedPayments.get(paymentId) || processedPayments.get(`plink_${paymentLinkId}`);
+            console.log(`🚫 Backup save prevented after double-check - webhook processed during verification`);
+            return res.json({ 
+              status: "already_saved", 
+              message: "Data saved by webhook during verification",
+              skipped: true,
+              originalContext: existingInfo?.context,
+              originalTimestamp: existingInfo?.timestamp
+            });
+          }
+        }
+      } catch (apiError) {
+        console.error(`⚠️ Could not verify payment link status for backup save:`, apiError.message);
+      }
+    }
+    
+    // Ensure we have the payment details
+    const enhancedBookingData = {
+      ...bookingData,
+      paymentId: paymentId,
+      orderId: orderId,
+      backupSavedAt: new Date().toISOString(),
+      source: 'thankyou_page_backup'
+    };
+
+    const paymentDetails = {
+      razorpay_payment_id: paymentId,
+      razorpay_order_id: orderId,
+      payment_link_id: paymentLinkId,
+    };
+
+    console.log(`🔄 Processing backup save for: ${bookingData.bookingName || 'Unknown'}`);
+
+    // 🎯 CRITICAL: Use single data save function with backup context
+    const saveResult = await saveBookingDataOnce(
+      enhancedBookingData, 
+      paymentDetails, 
+      'backup_' + Date.now(), 
+      'thankyou_page_backup'
+    );
+
+    if (saveResult.status === 'duplicate_prevented') {
+      return res.json({ 
+        status: "already_saved", 
+        message: `Data already saved by ${saveResult.originalContext}`,
+        skipped: true,
+        originalContext: saveResult.originalContext
+      });
+    }
+
+    if (saveResult.status === 'success') {
+      console.log(`✅ BACKUP SUCCESS: Data saved to both Firebase and Sheets`);
+      res.json({ 
+        status: "success", 
+        message: "Backup data saved successfully",
+        dataStored: saveResult.dataStored
+      });
+    } else if (saveResult.status === 'partial') {
+      console.log(`⚠️ BACKUP PARTIAL: Data saved partially`);
+      res.json({ 
+        status: "partial", 
+        message: "Backup data partially saved",
+        dataStored: saveResult.dataStored
+      });
+    } else {
+      console.log(`❌ BACKUP FAILED: Data not saved to either service`);
+      res.status(500).json({ 
+        status: "failed", 
+        message: "Failed to save backup data",
+        dataStored: saveResult.dataStored
+      });
+    }
+  } catch (error) {
+    console.error("❌ Backup data save failed:", error);
+    res.status(500).json({ 
+      error: "Backup save failed", 
+      details: error.message 
+    });
+  }
+});
+
 // Enhanced payment recovery endpoint
 app.post("/recover-payment", async (req, res) => {
   try {
@@ -1223,8 +1341,8 @@ app.get("/health", (req, res) => {
       retryLogic: true,
       ultimateDuplicateProtection: true, // 🎯 ENHANCED
       singleDataSaveOnly: true,
-      backupDataEndpoint: false, // 🎯 DISABLED to prevent duplicates
-      thankyouPageBackup: false, // 🎯 DISABLED to prevent duplicates
+      backupDataEndpoint: true,
+      thankyouPageBackup: true,
       webhookErrorRecovery: true,
       webhookOnlyDataSave: true,
       dualEventProtection: true,
@@ -1299,6 +1417,7 @@ app.listen(PORT, () => {
   console.log(`📡 Payment Links API Ready`);
   console.log(`🔗 Webhook endpoint: /webhook`);
   console.log(`🔄 Recovery endpoint: /recover-payment`);
+  console.log(`💾 Backup data endpoint: /save-backup-data`);
   console.log(`📊 Health check: /health`);
   console.log(`🧪 Test webhook: /test-webhook`);
   console.log(`✅ 🎯 ULTIMATE DUPLICATE PREVENTION SYSTEM v4.0:`);
@@ -1309,6 +1428,7 @@ app.listen(PORT, () => {
   console.log(`   • ✅ ENABLED: Contextual save tracking (webhook/backup/recovery)`);
   console.log(`   • ✅ ENABLED: Duplicate attempt monitoring and logging`);
   console.log(`   • ✅ ENABLED: Multiple duplicate prevention strategies`);
+  console.log(`   • ✅ ENABLED: Enhanced backup save duplicate prevention`);
   console.log(`   • ✅ ENABLED: Recovery endpoint duplicate prevention`);
   console.log(`   • ✅ ENABLED: Payment.captured event filtering for payment links`);
   console.log(`   • 🎯 CRITICAL: Data saved EXACTLY ONCE when payment is completed`);
