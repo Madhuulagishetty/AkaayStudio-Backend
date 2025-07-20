@@ -60,7 +60,7 @@ const processedPayments = new Set(); // Track processed payments to avoid duplic
 
 // Enhanced Google Sheets saving with retry logic
 const saveBookingToSheet = async (bookingData, retryCount = 0) => {
-  const maxRetries = 3;
+  const maxRetries = 1;
   
   try {
     console.log(`📝 Saving booking to Google Sheets (attempt ${retryCount + 1})...`);
