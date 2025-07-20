@@ -60,7 +60,7 @@ const processedPayments = new Set(); // Track processed payments to avoid duplic
 
 // Enhanced Google Sheets saving with retry logic
 const saveBookingToSheet = async (bookingData, retryCount = 0) => {
-  const maxRetries = 1;
+  const maxRetries = 3;
   
   try {
     console.log(`📝 Saving booking to Google Sheets (attempt ${retryCount + 1})...`);
@@ -192,7 +192,7 @@ const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
       bookingMeta: {
         createdAt: new Date(),
         source: "web",
-        version: "3.2",
+        version: "3.3",
         paymentMethod: "razorpay_payment_link",
         webhookProcessed: true,
         processedAt: new Date().toISOString()
@@ -520,14 +520,22 @@ const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId
     
     console.log(`🔍 [${requestId}] Processing payment link: ${paymentLinkId} with payment: ${paymentId}`);
     
-    // Prevent duplicate processing
+    // CRITICAL: Prevent duplicate processing - check both payment ID and payment link ID
     if (processedPayments.has(paymentId)) {
       console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
       return;
     }
     
-    // Mark as processing
+    // Also check if this payment link was already processed
+    const paymentLinkKey = `plink_${paymentLinkId}`;
+    if (processedPayments.has(paymentLinkKey)) {
+      console.log(`⚠️ [${requestId}] Payment link already processed: ${paymentLinkId}`);
+      return;
+    }
+    
+    // Mark both payment ID and payment link ID as processing
     processedPayments.add(paymentId);
+    processedPayments.add(paymentLinkKey);
     
     // Try to find order details with multiple lookup strategies
     let orderDetails = null;
@@ -770,7 +778,7 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
       paymentLinkId
     });
     
-    // Prevent duplicate processing
+    // CRITICAL: Prevent duplicate processing
     if (processedPayments.has(paymentId)) {
       console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
       return;
@@ -778,12 +786,24 @@ const handlePaymentCaptured = async (paymentEntity, requestId) => {
     
     // If this is a payment link payment, it should be handled by payment_link.paid event
     if (paymentLinkId) {
-      console.log(`ℹ️ [${requestId}] Payment link payment - should be handled by payment_link.paid event`);
-      return;
+      console.log(`ℹ️ [${requestId}] Payment link payment detected - checking if already processed by payment_link.paid event`);
+      
+      // Check if payment link was already processed
+      const paymentLinkKey = `plink_${paymentLinkId}`;
+      if (processedPayments.has(paymentLinkKey)) {
+        console.log(`✅ [${requestId}] Payment link already processed by payment_link.paid event - skipping payment.captured`);
+        return;
+      }
+      
+      console.log(`⚠️ [${requestId}] Payment link not yet processed - will process via payment.captured as fallback`);
     }
     
     // Mark as processing
     processedPayments.add(paymentId);
+    if (paymentLinkId) {
+      const paymentLinkKey = `plink_${paymentLinkId}`;
+      processedPayments.add(paymentLinkKey);
+    }
     
     // Handle regular order payments
     let orderDetails = null;
@@ -1024,7 +1044,7 @@ app.post("/save-backup-data", async (req, res) => {
     
     console.log(`💾 Backup data save requested for payment: ${paymentId}`);
     
-    // Check if data was already saved by webhook
+    // CRITICAL: Check if data was already saved by webhook (multiple checks)
     if (processedPayments.has(paymentId)) {
       console.log(`ℹ️ Payment ${paymentId} already processed by webhook - skipping backup save`);
       return res.json({ 
@@ -1032,6 +1052,20 @@ app.post("/save-backup-data", async (req, res) => {
         message: "Data already saved by webhook",
         skipped: true
       });
+    }
+    
+    // Also check for payment link processing
+    const paymentLinkId = bookingData.paymentLinkId;
+    if (paymentLinkId) {
+      const paymentLinkKey = `plink_${paymentLinkId}`;
+      if (processedPayments.has(paymentLinkKey)) {
+        console.log(`ℹ️ Payment link ${paymentLinkId} already processed by webhook - skipping backup save`);
+        return res.json({ 
+          status: "already_saved", 
+          message: "Data already saved by webhook (payment link)",
+          skipped: true
+        });
+      }
     }
     
     // Ensure we have the payment details
@@ -1050,6 +1084,13 @@ app.post("/save-backup-data", async (req, res) => {
     };
 
     console.log(`🔄 Processing backup save for: ${bookingData.bookingName || 'Unknown'}`);
+
+    // Mark as processing to prevent future duplicates
+    processedPayments.add(paymentId);
+    if (paymentLinkId) {
+      const paymentLinkKey = `plink_${paymentLinkId}`;
+      processedPayments.add(paymentLinkKey);
+    }
 
     // Save to both services with enhanced error handling
     const [firebaseResult, sheetsResult] = await Promise.allSettled([
@@ -1258,20 +1299,21 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     activeOrders: orderStore.size,
     processedPayments: processedPayments.size,
-    version: "3.2 - Single Data Save (Webhook Only)",
+    version: "3.3 - Enhanced Duplicate Prevention",
     environment: process.env.NODE_ENV || 'development',
     features: {
       webhookSignatureVerification: true,
       multipleOrderLookup: true,
       dataRecovery: true,
       retryLogic: true,
-      duplicateProtection: true,
+      enhancedDuplicateProtection: true,
       immediateDataSave: false, // 🎯 DISABLED
       singleDataSaveOnly: true, // 🎯 ENABLED
       backupDataEndpoint: true,
       thankyouPageBackup: true,
       webhookErrorRecovery: true,
-      webhookOnlyDataSave: true // 🎯 NEW FEATURE
+      webhookOnlyDataSave: true, // 🎯 NEW FEATURE
+      dualEventProtection: true // 🎯 NEW - Prevents both payment_link.paid and payment.captured from saving
     }
   });
 });
@@ -1311,21 +1353,24 @@ app.post("/test-webhook", (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Enhanced Server v3.2 running on port ${PORT}`);
+  console.log(`🚀 Enhanced Server v3.3 running on port ${PORT}`);
   console.log(`📡 Payment Links API Ready`);
   console.log(`🔗 Webhook endpoint: /webhook`);
   console.log(`🔄 Recovery endpoint: /recover-payment`);
   console.log(`💾 Backup data endpoint: /save-backup-data`);
   console.log(`📊 Health check: /health`);
   console.log(`🧪 Test webhook: /test-webhook`);
-  console.log(`✅ 🎯 SINGLE DATA SAVE SYSTEM ENABLED:`);
+  console.log(`✅ 🎯 ENHANCED DUPLICATE PREVENTION SYSTEM:`);
   console.log(`   • ❌ DISABLED: Immediate data save on payment link creation`);
   console.log(`   • ✅ ENABLED: Single data save only via webhook after payment`);
+  console.log(`   • ✅ ENABLED: Dual event protection (payment_link.paid + payment.captured)`);
+  console.log(`   • ✅ ENABLED: Payment link ID tracking in processed payments`);
   console.log(`   • ✅ ENABLED: Improved webhook signature verification`);
   console.log(`   • ✅ ENABLED: Multiple order lookup strategies`);
   console.log(`   • ✅ ENABLED: Automatic data recovery system`);
   console.log(`   • ✅ ENABLED: Retry logic for data saving`);
-  console.log(`   • ✅ ENABLED: Duplicate payment protection`);
+  console.log(`   • ✅ ENABLED: Enhanced duplicate payment protection`);
   console.log(`   • ✅ ENABLED: Better error handling and logging`);
-  console.log(`   • 🎯 KEY CHANGE: Data saved ONLY when payment is completed`);
+  console.log(`   • 🎯 KEY CHANGE: Data saved EXACTLY ONCE when payment is completed`);
+  console.log(`   • 🎯 NEW: Prevents duplicate saves from multiple webhook events`);
 });
