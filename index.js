@@ -433,75 +433,82 @@ app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-razorpay-signature'];
   const eventId = req.headers['x-razorpay-event-id'];
 
-  console.log('Received webhook event:', { signature, eventId });
+  console.log('[info] Received webhook event:', { signature, eventId });
 
-  // 1. Prevent duplicate event IDs
+  // Step 1: Prevent duplicate event IDs
   if (processedPayments.has(eventId)) {
-    console.log(`🔁 Duplicate webhook event skipped: ${eventId}`);
+    console.log(`[info] 🔁 Duplicate webhook event skipped: ${eventId}`);
     return res.status(200).send('OK');
   }
   processedPayments.add(eventId);
-  console.log(`✅ Event ${eventId} added to processedPayments`);
+  console.log(`[info] ✅ Event ${eventId} added to processedPayments`);
 
-  // 2. Verify signature
+  // Step 2: Verify signature
   const expected = crypto
     .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
-    .update(req.body)
+    .update(req.body) // raw body from express.raw middleware
     .digest('hex');
 
-  console.log('Expected signature:', expected);
-  console.log('Received signature:', signature);
+  console.log('[info] Expected signature:', expected);
+  console.log('[info] Received signature:', signature);
 
   if (signature !== expected) {
-    console.error('❌ Invalid webhook signature');
+    console.error('[error] ❌ Invalid webhook signature');
     return res.status(400).send('Invalid signature');
   }
 
-  // 3. Parse raw body to JSON
+  // Step 3: Parse raw body to JSON
   let jsonBody;
   try {
     jsonBody = JSON.parse(req.body.toString('utf8'));
   } catch (err) {
-    console.error('❌ Error parsing JSON body:', err);
+    console.error('[error] ❌ Error parsing JSON body:', err);
     return res.status(400).send('Invalid JSON');
   }
 
   const { event, payload } = jsonBody;
-  console.log('Webhook event:', event);
-  console.log('Payload:', JSON.stringify(payload, null, 2));
+  console.log('[info] Webhook event:', event);
+  console.log('[info] Payload:', JSON.stringify(payload, null, 2));
 
-  // 4. Process specific events
+  // Step 4: Process relevant payment events
   if (event === 'payment.captured' || event === 'payment_link.paid' || event === 'order.paid') {
     const payment = payload.payment?.entity || payload.payment_link?.entity || payload.order?.entity;
     const orderId = payment.order_id || payload.order?.entity?.id;
     const paymentId = payment.id || payload.payment_link?.entity?.payment_id;
 
-    console.log(`🔑 Payment ID: ${paymentId}, Order ID: ${orderId}`);
+    console.log(`[info] 🔑 Payment ID: ${paymentId}, Order ID: ${orderId}`);
 
-    // 5. Save booking data if exists and not already processed
+    // Extra logs to debug why bookingData might be missing
+    console.log('[debug] Looking for orderId in orderStore:', orderId);
+    console.log('[debug] Current orderStore keys:', Array.from(orderStore.keys()));
+
+    // Step 5: Check if booking data exists
     if (orderId && paymentId && !processedPayments.has(paymentId)) {
       const bookingData = orderStore.get(orderId);
       if (bookingData) {
         try {
-          console.log(`📦 Booking data found for order ${orderId}`);
+          console.log(`[info] 📦 Booking data found for order ${orderId}`);
           await saveBookingToSheet({ ...bookingData, paymentId, orderId });
-          console.log(`✅ Booking saved to sheet`);
+          console.log(`[info] ✅ Booking saved to Google Sheet`);
           await saveToFirebase(bookingData, { razorpay_payment_id: paymentId, razorpay_order_id: orderId });
-          console.log(`✅ Booking saved to Firebase`);
-          processedPayments.add(paymentId);
+          console.log(`[info] ✅ Booking saved to Firebase`);
+          processedPayments.add(paymentId); // mark paymentId processed too
         } catch (err) {
-          console.error('❌ Error saving booking info:', err.message);
+          console.error('[error] ❌ Error saving booking info:', err.message);
         }
       } else {
-        console.log(`⚠️ No booking data found for order ${orderId}`);
+        console.warn(`[warn] ⚠️ No booking data found for order ${orderId}`);
       }
+    } else {
+      console.warn(`[warn] ⚠️ Missing orderId/paymentId or already processed paymentId`);
     }
   } else {
-    console.log(`ℹ️ Ignoring event type: ${event}`);
+    console.log(`[info] ℹ️ Ignoring event type: ${event}`);
   }
 
   res.status(200).send('OK');
 });
+
 
 // MODIFIED: Enhanced payment link handler - ONLY SAVE DATA HERE (SINGLE TIME)
 const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId) => {
