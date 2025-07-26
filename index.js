@@ -428,88 +428,56 @@ const verifyWebhookSignature = (body, signature, secret) => {
 };
 
 // CRITICAL: Enhanced webhook handler with better error handling
-app.post("/webhook", async (req, res) => {
-  const startTime = Date.now();
-  const requestId = Math.random().toString(36).substr(2, 9);
-  
-  try {
-    const webhookSignature = req.headers["x-razorpay-signature"];
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+app.post('/webhook', async (req, res) => {
+  const signature = req.headers['x-razorpay-signature'];
+  const eventId = req.headers['x-razorpay-event-id'];
 
-    console.log(`🔔 [${requestId}] Webhook received at ${new Date().toISOString()}`);
-    console.log(`🔍 [${requestId}] Headers:`, {
-      signature: webhookSignature ? 'Present' : 'Missing',
-      contentType: req.headers['content-type'],
-      contentLength: req.headers['content-length']
-    });
-    
-    if (!webhookSecret) {
-      console.error(`❌ [${requestId}] Webhook secret not configured`);
-      return res.status(500).json({ error: "Webhook secret not configured" });
-    }
-
-    if (!webhookSignature) {
-      console.error(`❌ [${requestId}] Missing webhook signature`);
-      return res.status(400).json({ error: "Missing webhook signature" });
-    }
-
-    // Verify webhook signature using raw body
-    const isValidSignature = verifyWebhookSignature(
-      req.body,
-      webhookSignature,
-      webhookSecret
-    );
-
-    if (!isValidSignature) {
-      console.error(`❌ [${requestId}] Invalid webhook signature`);
-      return res.status(400).json({ error: "Invalid signature" });
-    }
-
-    console.log(`✅ [${requestId}] Webhook signature verified`);
-
-    // Parse the event from raw body
-    const event = JSON.parse(req.body.toString('utf8'));
-    
-    console.log(`🔔 [${requestId}] Event: ${event.event}`);
-    console.log(`📊 [${requestId}] Event details:`, {
-      event: event.event,
-      entity: event.payload?.payment?.entity?.id || event.payload?.payment_link?.entity?.id || 'Unknown'
-    });
-
-    // Handle different event types
-    switch (event.event) {
-      case "payment_link.paid":
-        await handlePaymentLinkPaid(event.payload.payment_link.entity, event.payload.payment.entity, requestId);
-        break;
-        
-      case "payment.captured":
-        await handlePaymentCaptured(event.payload.payment.entity, requestId);
-        break;
-        
-      case "payment.failed":
-        await handlePaymentFailed(event.payload.payment.entity, requestId);
-        break;
-        
-      default:
-        console.log(`ℹ️ [${requestId}] Ignored event: ${event.event}`);
-    }
-    
-    const processingTime = Date.now() - startTime;
-    console.log(`✅ [${requestId}] Webhook processed in ${processingTime}ms`);
-    
-    res.json({ 
-      status: "success", 
-      processingTime: `${processingTime}ms`,
-      requestId 
-    });
-  } catch (error) {
-    console.error(`❌ [${requestId}] Webhook error:`, error);
-    res.status(500).json({ 
-      error: "Webhook processing failed", 
-      message: error.message,
-      requestId 
-    });
+  // 1. Duplicate event prevention
+  if (processedPayments.has(eventId)) {
+    console.log(`🔁 Duplicate webhook event skipped: ${eventId}`);
+    return res.status(200).send('OK');
   }
+  processedPayments.add(eventId);
+
+  // 2. Verify signature
+  const expected = crypto
+    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
+    .update(req.body)  // note: req.body is raw, thanks to express.raw middleware
+    .digest('hex');
+
+  if (signature !== expected) {
+    console.error('❌ Invalid webhook signature', signature, expected);
+    return res.status(400).send('Invalid signature');
+  }
+
+  const { event, payload } = req.body;
+
+  // 3. Only process payment success events (customize as needed)
+  if (event === 'payment.captured' || event === 'payment_link.paid' || event === 'order.paid') {
+    const payment = payload.payment?.entity || payload.payment_link?.entity || payload.order?.entity;
+    const orderId = payment.order_id || payload.order?.entity?.id;
+    const paymentId = payment.id || payload.payment_link?.entity?.payment_id;
+
+
+
+    // 5. Save bookingData from your mapped orderStore
+    const bookingData = orderStore.get(orderId);
+    if (bookingData && !processedPayments.has(paymentId)) {
+      try {
+        await saveBookingToSheet({ ...bookingData, paymentId, orderId });
+        await saveToFirebase(bookingData, { razorpay_payment_id: paymentId, razorpay_order_id: orderId });
+        console.log('✅ Booking saved for order', orderId);
+      } catch (err) {
+        console.error('❌ Error saving booking info', err.message);
+      }
+    } else {
+      console.log(`⚠️ No booking found for order ${orderId} or already processed.`);
+    }
+  } else {
+    console.log(`ℹ️ Ignoring event type: ${event}`);
+  }
+
+  res.status(200).send('OK');
 });
 
 // MODIFIED: Enhanced payment link handler - ONLY SAVE DATA HERE (SINGLE TIME)
