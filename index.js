@@ -428,9 +428,15 @@ const verifyWebhookSignature = (body, signature, secret) => {
 };
 
 // CRITICAL: Enhanced webhook handler with better error handling
+
 app.post('/webhook', async (req, res) => {
+  const processedPayments = new Set(); // A Set to keep track of processed payment events
+
   const signature = req.headers['x-razorpay-signature'];
   const eventId = req.headers['x-razorpay-event-id'];
+
+  // Debugging: Log incoming headers
+  console.log('Received webhook event:', { signature, eventId });
 
   // 1. Duplicate event prevention
   if (processedPayments.has(eventId)) {
@@ -438,12 +444,16 @@ app.post('/webhook', async (req, res) => {
     return res.status(200).send('OK');
   }
   processedPayments.add(eventId);
+  console.log(`✅ Event ${eventId} added to processedPayments`);
 
   // 2. Verify signature
   const expected = crypto
     .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
     .update(req.body)  // note: req.body is raw, thanks to express.raw middleware
     .digest('hex');
+
+  console.log('Expected signature:', expected);
+  console.log('Received signature:', signature);
 
   if (signature !== expected) {
     console.error('❌ Invalid webhook signature', signature, expected);
@@ -452,23 +462,30 @@ app.post('/webhook', async (req, res) => {
 
   const { event, payload } = req.body;
 
-  // 3. Only process payment success events (customize as needed)
+  // 3. Log event and payload for debugging
+  console.log('Webhook event:', event);
+  console.log('Payload:', JSON.stringify(payload, null, 2));
+
+  // 4. Only process payment success events (customize as needed)
   if (event === 'payment.captured' || event === 'payment_link.paid' || event === 'order.paid') {
     const payment = payload.payment?.entity || payload.payment_link?.entity || payload.order?.entity;
     const orderId = payment.order_id || payload.order?.entity?.id;
     const paymentId = payment.id || payload.payment_link?.entity?.payment_id;
 
-
+    // Log payment details
+    console.log(`🔑 Payment ID: ${paymentId}, Order ID: ${orderId}`);
 
     // 5. Save bookingData from your mapped orderStore
     const bookingData = orderStore.get(orderId);
     if (bookingData && !processedPayments.has(paymentId)) {
       try {
+        console.log(`📦 Booking data found for order ${orderId}`);
         await saveBookingToSheet({ ...bookingData, paymentId, orderId });
+        console.log(`✅ Booking saved to sheet for order ${orderId}`);
         await saveToFirebase(bookingData, { razorpay_payment_id: paymentId, razorpay_order_id: orderId });
-        console.log('✅ Booking saved for order', orderId);
+        console.log(`✅ Booking saved to Firebase for order ${orderId}`);
       } catch (err) {
-        console.error('❌ Error saving booking info', err.message);
+        console.error('❌ Error saving booking info:', err.message);
       }
     } else {
       console.log(`⚠️ No booking found for order ${orderId} or already processed.`);
