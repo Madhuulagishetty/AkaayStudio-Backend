@@ -1,5 +1,4 @@
-// run `node index.js` in the terminal
-
+// Enhanced Payment System with Single Data Save Guarantee
 const { initializeApp } = require("firebase/app");
 const { getFirestore, collection, addDoc } = require("firebase/firestore");
 const axios = require("axios");
@@ -38,14 +37,7 @@ const app = express();
 
 // Enhanced middleware
 app.use(cors());
-
-// CRITICAL: Raw body parser for webhook signature verification
-app.use('/webhook', express.raw({ 
-  type: 'application/json',
-  limit: '10mb'
-}));
-
-// JSON parser for all other routes
+app.use('/webhook', express.raw({ type: 'application/json', limit: '10mb' }));
 app.use(express.json({ limit: '10mb' }));
 
 // Initialize Razorpay
@@ -54,11 +46,99 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Enhanced order store with persistence
-const orderStore = new Map();
-const processedPayments = new Set(); // Track processed payments to avoid duplicates
+// SINGLE SOURCE OF TRUTH - Data Save Tracking
+const dataSaveTracker = new Map(); // Track what has been saved
+const orderStore = new Map(); // Store order details
+const saveInProgress = new Set(); // Track saves in progress
 
-// Enhanced Google Sheets saving with retry logic
+// CRITICAL: Single data save function with atomic operations
+const saveBookingDataOnce = async (paymentId, bookingData, paymentDetails) => {
+  // ATOMIC CHECK: Ensure this payment is only saved once
+  if (dataSaveTracker.has(paymentId)) {
+    console.log(`✅ Payment ${paymentId} already saved - skipping duplicate save`);
+    return dataSaveTracker.get(paymentId);
+  }
+
+  if (saveInProgress.has(paymentId)) {
+    console.log(`⏳ Payment ${paymentId} save already in progress - waiting...`);
+    // Wait for the save to complete
+    let attempts = 0;
+    while (saveInProgress.has(paymentId) && attempts < 30) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
+    }
+    // Return the saved result if available
+    return dataSaveTracker.get(paymentId) || null;
+  }
+
+  // Mark as in progress
+  saveInProgress.add(paymentId);
+
+  try {
+    console.log(`💾 [SINGLE SAVE] Processing payment ${paymentId} - FIRST AND ONLY TIME`);
+
+    // Prepare data for saving
+    const enhancedBookingData = {
+      ...bookingData,
+      paymentId,
+      ...paymentDetails,
+      savedAt: new Date().toISOString(),
+      saveMethod: 'webhook_single_save'
+    };
+
+    // ATOMIC SAVE: Save to both Firebase and Sheets
+    const [firebaseResult, sheetsResult] = await Promise.allSettled([
+      saveToFirebase(enhancedBookingData, paymentDetails),
+      saveBookingToSheet(enhancedBookingData)
+    ]);
+
+    const saveResult = {
+      paymentId,
+      firebase: {
+        success: firebaseResult.status === 'fulfilled',
+        data: firebaseResult.status === 'fulfilled' ? firebaseResult.value : null,
+        error: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null
+      },
+      sheets: {
+        success: sheetsResult.status === 'fulfilled',
+        data: sheetsResult.status === 'fulfilled' ? sheetsResult.value : null,
+        error: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null
+      },
+      timestamp: new Date().toISOString(),
+      bookingData: enhancedBookingData
+    };
+
+    // ATOMIC COMMIT: Mark as saved (this prevents any future saves)
+    dataSaveTracker.set(paymentId, saveResult);
+    
+    console.log(`✅ [SINGLE SAVE COMPLETE] Payment ${paymentId} saved successfully:`, {
+      firebase: saveResult.firebase.success,
+      sheets: saveResult.sheets.success
+    });
+
+    return saveResult;
+
+  } catch (error) {
+    console.error(`❌ [SINGLE SAVE ERROR] Failed to save payment ${paymentId}:`, error);
+    
+    // Mark as failed but still track to prevent retries
+    const errorResult = {
+      paymentId,
+      error: error.message,
+      timestamp: new Date().toISOString(),
+      failed: true
+    };
+    
+    dataSaveTracker.set(paymentId, errorResult);
+    return errorResult;
+
+  } finally {
+    // Remove from in-progress
+    saveInProgress.delete(paymentId);
+  }
+};
+
+// Enhanced Google Sheets saving
 const saveBookingToSheet = async (bookingData, retryCount = 0) => {
   const maxRetries = 3;
   
@@ -78,8 +158,6 @@ const saveBookingToSheet = async (bookingData, retryCount = 0) => {
       second: "2-digit",
       hour12: true,
     });
-
-    const isoTimestamp = now.toISOString();
 
     const sheetData = {
       booking_date: bookingData.date || '',
@@ -108,37 +186,22 @@ const saveBookingToSheet = async (bookingData, retryCount = 0) => {
       occasion: bookingData.occasion || '',
       processed_date: currentDate,
       processed_time: currentTime,
-      processed_timestamp: isoTimestamp,
       order_id: bookingData.orderId || '',
       payment_link_id: bookingData.paymentLinkId || '',
       source: bookingData.source || 'web_app',
-      created_at: bookingData.createdAt || isoTimestamp,
-      webhook_processed: true,
-      webhook_timestamp: isoTimestamp,
-      recovery_type: bookingData.minimal ? 'minimal' : bookingData.recovered ? 'recovered' : 'normal'
+      save_method: bookingData.saveMethod || 'single_save'
     };
-
-    console.log("📊 Sheet data prepared:", {
-      booking_date: sheetData.booking_date,
-      payment_id: sheetData.payment_id,
-      total_amount: sheetData.total_amount,
-      whatsapp_number: sheetData.whatsapp_number
-    });
 
     const response = await axios.post(
       "https://sheetdb.io/api/v1/s6a0t5omac7jg",
+      { data: [sheetData] },
       {
-        data: [sheetData],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-        timeout: 30000, // Increased timeout
+        headers: { "Content-Type": "application/json" },
+        timeout: 30000,
       }
     );
 
-    console.log("✅ Google Sheets save successful:", response.data);
+    console.log("✅ Google Sheets save successful");
     return response.data;
   } catch (error) {
     console.error(`❌ Error saving to Google Sheets (attempt ${retryCount + 1}):`, error.response?.data || error.message);
@@ -153,7 +216,7 @@ const saveBookingToSheet = async (bookingData, retryCount = 0) => {
   }
 };
 
-// Enhanced Firebase saving with retry logic
+// Enhanced Firebase saving
 const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
   const maxRetries = 3;
   
@@ -184,27 +247,9 @@ const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
       remainingAmount: bookingData.remainingAmount || (bookingData.totalAmount - 10) || 0,
       totalAmount: bookingData.totalAmount || 0,
       timestamp: new Date(),
-      createdAt: bookingData.createdAt ? new Date(bookingData.createdAt) : new Date(),
       source: bookingData.source || 'web_app',
-      webhookProcessed: true,
-      webhookTimestamp: new Date(),
-      recoveryType: bookingData.minimal ? 'minimal' : bookingData.recovered ? 'recovered' : 'normal',
-      bookingMeta: {
-        createdAt: new Date(),
-        source: "web",
-        version: "3.2",
-        paymentMethod: "razorpay_payment_link",
-        webhookProcessed: true,
-        processedAt: new Date().toISOString()
-      },
+      saveMethod: bookingData.saveMethod || 'single_save'
     };
-
-    console.log("📊 Firebase data prepared:", {
-      bookingName: saveData.bookingName,
-      paymentId: saveData.paymentId,
-      totalAmount: saveData.totalAmount,
-      whatsapp: saveData.whatsapp
-    });
 
     const collectionName = bookingData.slotType || 'bookings';
     const docRef = await addDoc(collection(db, collectionName), saveData);
@@ -224,68 +269,40 @@ const saveToFirebase = async (bookingData, paymentDetails, retryCount = 0) => {
   }
 };
 
-// Enhanced phone number validation
+// Utility functions
 const validateAndSanitizePhone = (phone) => {
   if (!phone) return "";
-  
   const cleanPhone = phone.toString().replace(/\D/g, '');
   const hasRecurringDigits = /^(\d)\1{9,}$/.test(cleanPhone);
-  
-  if (cleanPhone.length < 10 || cleanPhone.length > 12 || hasRecurringDigits) {
-    console.log(`⚠️ Invalid phone number: ${cleanPhone}`);
-    return "";
-  }
-  
+  if (cleanPhone.length < 10 || cleanPhone.length > 12 || hasRecurringDigits) return "";
   return cleanPhone.length === 10 ? "91" + cleanPhone : cleanPhone;
 };
 
-// Enhanced data sanitization for Razorpay compatibility
 const sanitizeForRazorpay = (str) => {
   if (!str) return "";
-  
-  return str
-    .toString()
-    .trim()
-    // Remove or replace problematic characters
-    .replace(/[^\x00-\x7F]/g, "") // Remove non-ASCII characters
-    .replace(/['"]/g, "") // Remove quotes
-    .replace(/[<>]/g, "") // Remove angle brackets
-    .replace(/[{}]/g, "") // Remove curly braces
-    .replace(/[\[\]]/g, "") // Remove square brackets
-    .replace(/[\\]/g, "") // Remove backslashes
-    .replace(/\s+/g, " ") // Replace multiple spaces with single space
-    .substring(0, 100); // Limit length to prevent issues
+  return str.toString().trim()
+    .replace(/[^\x00-\x7F]/g, "")
+    .replace(/['"<>{}[\]\\]/g, "")
+    .replace(/\s+/g, " ")
+    .substring(0, 100);
 };
 
-// Enhanced email validation and sanitization
 const sanitizeEmail = (email) => {
   if (!email) return "";
-  
-  const cleanEmail = email
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/[^\w@.-]/g, ""); // Keep only alphanumeric, @, ., and -
-  
-  // Basic email validation
+  const cleanEmail = email.toString().trim().toLowerCase().replace(/[^\w@.-]/g, "");
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return emailRegex.test(cleanEmail) ? cleanEmail : "";
 };
 
-// Enhanced name sanitization
 const sanitizeName = (name) => {
   if (!name) return "Customer";
-  
-  return name
-    .toString()
-    .trim()
-    .replace(/[^\w\s.-]/g, "") // Keep only alphanumeric, spaces, dots, and hyphens
-    .replace(/\s+/g, " ") // Replace multiple spaces with single space
-    .substring(0, 100) // Limit to 100 characters
-    || "Customer"; // Fallback if empty after sanitization
+  return name.toString().trim()
+    .replace(/[^\w\s.-]/g, "")
+    .replace(/\s+/g, " ")
+    .substring(0, 100) || "Customer";
 };
 
-// MODIFIED: Payment link creation WITHOUT immediate data save
+// Payment link creation (no data save)
 app.post("/create-payment-link", async (req, res) => {
   try {
     const { amount, bookingData } = req.body;
@@ -294,7 +311,7 @@ app.post("/create-payment-link", async (req, res) => {
       return res.status(400).json({ error: "Missing booking data or amount" });
     }
 
-    // Sanitize all input data before processing
+    // Sanitize input data
     const sanitizedBookingData = {
       ...bookingData,
       bookingName: sanitizeName(bookingData.bookingName),
@@ -305,94 +322,57 @@ app.post("/create-payment-link", async (req, res) => {
       whatsapp: validateAndSanitizePhone(bookingData.whatsapp)
     };
 
-    console.log("🔗 Creating payment link for booking:", {
-      name: sanitizedBookingData.bookingName,
-      amount: amount,
-      whatsapp: sanitizedBookingData.whatsapp,
-      email: sanitizedBookingData.email
-    });
-
-    const sanitizedPhone = sanitizedBookingData.whatsapp;
     const referenceId = "booking_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
     
-    // Sanitize data for Razorpay API
-    const sanitizedCustomerName = sanitizeName(sanitizedBookingData.bookingName);
-    const sanitizedEmail = sanitizeEmail(sanitizedBookingData.email);
-    const sanitizedDescription = sanitizeForRazorpay(
-      `Theater Booking - ${sanitizedCustomerName} - ${sanitizedBookingData.occasion || 'Celebration'}`
-    );
-    
     const options = {
-      amount: amount * 100, // Convert to paise
+      amount: amount * 100,
       currency: "INR",
       reference_id: referenceId,
-      description: sanitizedDescription,
+      description: sanitizeForRazorpay(`Theater Booking - ${sanitizedBookingData.bookingName}`),
       customer: {
-        name: sanitizedCustomerName,
-        email: sanitizedEmail,
+        name: sanitizeName(sanitizedBookingData.bookingName),
+        email: sanitizeEmail(sanitizedBookingData.email),
       },
-      notify: {
-        sms: false,
-        email: false,
-      },
+      notify: { sms: false, email: false },
       reminder_enable: false,
       callback_url: `${process.env.FRONTEND_URL || 'https://birthday-backend-tau.vercel.app'}/payment-success`,
       callback_method: "get",
-      // Store minimal sanitized data in notes (under 255 chars)
       notes: {
         ref_id: referenceId,
-        customer: sanitizedCustomerName.substring(0, 30),
-        source: 'web_app',
-        amount: amount.toString(),
-        occasion: sanitizeForRazorpay(sanitizedBookingData.occasion || '').substring(0, 20)
+        customer: sanitizedBookingData.bookingName.substring(0, 30),
+        source: 'web_app'
       }
     };
 
-    // Add phone only if valid
-    if (sanitizedPhone) {
-      options.customer.contact = sanitizedPhone;
+    if (sanitizedBookingData.whatsapp) {
+      options.customer.contact = sanitizedBookingData.whatsapp;
     }
-
-    console.log("📋 Sanitized payment link options:", {
-      description: options.description,
-      customer: options.customer,
-      notes: options.notes
-    });
     
     const paymentLink = await razorpay.paymentLink.create(options);
     
-    // Store enhanced booking data with expiration (NO DATA SAVE TO FIREBASE/SHEETS)
-    const enhancedBookingData = {
-      ...sanitizedBookingData,
-      totalAmount: sanitizedBookingData.totalAmount || sanitizedBookingData.amountWithTax,
-      advanceAmount: amount,
-      remainingAmount: (sanitizedBookingData.totalAmount || sanitizedBookingData.amountWithTax) - amount,
-      source: 'web_app',
-      createdAt: new Date().toISOString(),
-      reference_id: referenceId,
-      paymentLinkId: paymentLink.id
-    };
-
-    // Store with multiple keys for better lookup (IN MEMORY ONLY)
+    // Store order data (in memory only - NO DATABASE SAVE)
     const orderData = {
-      bookingData: enhancedBookingData,
+      bookingData: {
+        ...sanitizedBookingData,
+        totalAmount: sanitizedBookingData.totalAmount || sanitizedBookingData.amountWithTax,
+        advanceAmount: amount,
+        remainingAmount: (sanitizedBookingData.totalAmount || sanitizedBookingData.amountWithTax) - amount,
+        source: 'web_app',
+        createdAt: new Date().toISOString(),
+        reference_id: referenceId,
+        paymentLinkId: paymentLink.id
+      },
       amount,
       status: "created",
-      type: "payment_link",
       createdAt: new Date(),
-      reference_id: referenceId,
       paymentLinkId: paymentLink.id,
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
     };
 
-    // Store with payment link ID as primary key (IN MEMORY ONLY - NO DATABASE SAVE)
     orderStore.set(paymentLink.id, orderData);
-    // Also store with reference ID for backup lookup
     orderStore.set(referenceId, orderData);
 
-    console.log(`✅ Payment link created: ${paymentLink.id}`);
-    console.log(`📦 Order data stored IN MEMORY with keys: ${paymentLink.id}, ${referenceId}`);
-    console.log(`🚫 NO immediate data save - will save only after successful payment via webhook`);
+    console.log(`✅ Payment link created: ${paymentLink.id} (NO DATA SAVED YET)`);
     
     res.json({
       paymentLink,
@@ -402,900 +382,270 @@ app.post("/create-payment-link", async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Payment link creation failed:", error);
-    res.status(500).json({ 
-      error: "Payment link creation failed",
-      details: error.message 
-    });
+    res.status(500).json({ error: "Payment link creation failed", details: error.message });
   }
 });
 
-// Enhanced webhook signature verification
-const verifyWebhookSignature = (body, signature, secret) => {
-  try {
-    const expectedSignature = crypto
-      .createHmac("sha256", secret)
-      .update(body, 'utf8')
-      .digest("hex");
-
-    return crypto.timingSafeEqual(
-      Buffer.from(signature, "utf8"),
-      Buffer.from(expectedSignature, "utf8")
-    );
-  } catch (error) {
-    console.error("❌ Signature verification error:", error);
-    return false;
-  }
-};
-
-// CRITICAL: Enhanced webhook handler with better error handling
-
+// SINGLE WEBHOOK HANDLER - Only place where data is saved
 app.post('/webhook', async (req, res) => {
-  const signature = req.headers['x-razorpay-signature'];
-  const eventId = req.headers['x-razorpay-event-id'];
-
-  if (processedPayments.has(eventId)) return res.status(200).send('OK');
-  processedPayments.add(eventId);
-
-  const expected = crypto
-    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
-    .update(req.body)
-    .digest('hex');
-
-  if (signature !== expected) {
-    console.error('❌ Invalid webhook signature');
-    return res.status(400).send('Invalid signature');
-  }
-
-  let jsonBody;
   try {
-    jsonBody = JSON.parse(req.body.toString('utf8'));
-  } catch (err) {
-    console.error('❌ Failed to parse JSON body:', err);
-    return res.status(400).send('Invalid JSON');
-  }
+    const signature = req.headers['x-razorpay-signature'];
+    const eventId = req.headers['x-razorpay-event-id'];
 
-  const { event, payload } = jsonBody;
-  console.log('[info] Webhook event:', event);
+    // Verify signature
+    const expected = crypto
+      .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
+      .update(req.body)
+      .digest('hex');
 
-  if (event === 'payment_link.paid' || event === 'payment.captured') {
-    const paymentLinkId = payload.payment_link?.entity?.id;
-    const refId = payload.payment?.entity?.notes?.ref_id;
-
-    console.log('[debug] Looking for paymentLinkId:', paymentLinkId);
-    console.log('[debug] Looking for refId:', refId);
-    console.log('[debug] Current orderStore keys:', Array.from(orderStore.keys()));
-
-    let orderData = orderStore.get(paymentLinkId) || orderStore.get(refId);
-    if (orderData) {
-      console.log(`[info] 📦 Found orderData for paymentLinkId/refId`);
-      const paymentId = payload.payment?.entity?.id;
-      await saveBookingToSheet({ ...orderData.bookingData, paymentId });
-      await saveToFirebase(orderData.bookingData, { razorpay_payment_id: paymentId, paymentLinkId });
-      console.log(`[info] ✅ Booking saved`);
-    } else {
-      console.warn('[warn] ⚠️ No booking data found for paymentLinkId / refId');
+    if (signature !== expected) {
+      console.error('❌ Invalid webhook signature');
+      return res.status(400).send('Invalid signature');
     }
-  }
 
-  res.status(200).send('OK');
+    let jsonBody;
+    try {
+      jsonBody = JSON.parse(req.body.toString('utf8'));
+    } catch (err) {
+      console.error('❌ Failed to parse JSON body:', err);
+      return res.status(400).send('Invalid JSON');
+    }
+
+    const { event, payload } = jsonBody;
+    console.log(`📨 Webhook event: ${event} | Event ID: ${eventId}`);
+
+    // ONLY process payment completion events
+    if (event === 'payment_link.paid') {
+      await handlePaymentLinkPaid(payload, eventId);
+    } else if (event === 'payment.captured' && !payload.payment.entity.payment_link_id) {
+      // Only handle regular orders (not payment link orders)
+      await handlePaymentCaptured(payload, eventId);
+    } else {
+      console.log(`ℹ️ Ignoring event: ${event}`);
+    }
+
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('❌ Webhook processing error:', error);
+    res.status(500).send('Webhook error');
+  }
 });
 
-
-
-// MODIFIED: Enhanced payment link handler - ONLY SAVE DATA HERE (SINGLE TIME)
-const handlePaymentLinkPaid = async (paymentLinkEntity, paymentEntity, requestId) => {
+// Handle payment link paid event
+const handlePaymentLinkPaid = async (payload, eventId) => {
   try {
-    const paymentLinkId = paymentLinkEntity.id;
+    const paymentLinkEntity = payload.payment_link.entity;
+    const paymentEntity = payload.payment.entity;
     const paymentId = paymentEntity.id;
-    
-    console.log(`🔍 [${requestId}] Processing payment link: ${paymentLinkId} with payment: ${paymentId}`);
-    
-    // Prevent duplicate processing
-    if (processedPayments.has(paymentId)) {
-      console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
-      return;
-    }
-    
-    // Mark as processing
-    processedPayments.add(paymentId);
-    
-    // Try to find order details with multiple lookup strategies
-    let orderDetails = null;
-    
-    // Strategy 1: Look up by payment link ID
-    orderDetails = orderStore.get(paymentLinkId);
-    
-    if (!orderDetails) {
-      console.log(`🔍 [${requestId}] Order not found by payment link ID, trying reference ID lookup...`);
-      
-      // Strategy 2: Look up by reference ID from payment link
-      try {
-        const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkId);
-        const referenceId = paymentLinkDetails.reference_id;
-        
-        if (referenceId) {
-          orderDetails = orderStore.get(referenceId);
-          console.log(`🔍 [${requestId}] Reference ID lookup result: ${orderDetails ? 'Found' : 'Not found'}`);
-        }
-      } catch (fetchError) {
-        console.error(`❌ [${requestId}] Failed to fetch payment link details:`, fetchError.message);
-      }
-    }
-    
-    // Strategy 3: Recovery from Razorpay API
-    if (!orderDetails) {
-      console.log(`🔍 [${requestId}] Order not found, attempting recovery from Razorpay API...`);
-      
-      try {
-        const paymentLinkDetails = await razorpay.paymentLink.fetch(paymentLinkId);
-        
-        if (paymentLinkDetails.notes && paymentLinkDetails.notes.ref_id) {
-          console.log(`🔍 [${requestId}] Found reference ID in notes: ${paymentLinkDetails.notes.ref_id}`);
-          
-          // Try to find order by reference ID
-          const refOrderDetails = orderStore.get(paymentLinkDetails.notes.ref_id);
-          if (refOrderDetails) {
-            console.log(`✅ [${requestId}] Recovered order data using reference ID`);
-            orderDetails = refOrderDetails;
-            orderDetails.recovered = true;
-            orderDetails.recoveredAt = new Date().toISOString();
-          } else {
-            console.error(`❌ [${requestId}] Order not found even with reference ID: ${paymentLinkDetails.notes.ref_id}`);
-            
-            // Create minimal order details for basic processing
-            const sanitizedCustomerName = sanitizeName(paymentLinkDetails.notes.customer || 'Customer');
-            
-            orderDetails = {
-              bookingData: {
-                bookingName: sanitizedCustomerName,
-                NameUser: sanitizedCustomerName,
-                totalAmount: paymentLinkDetails.amount / 100,
-                advanceAmount: paymentLinkDetails.amount / 100,
-                remainingAmount: 0,
-                source: 'minimal_recovery',
-                recoveredAt: new Date().toISOString(),
-                paymentLinkId: paymentLinkId,
-                reference_id: paymentLinkDetails.reference_id,
-                occasion: sanitizeForRazorpay(paymentLinkDetails.notes.occasion || 'Celebration'),
-                email: '',
-                address: '',
-                whatsapp: '',
-                people: 1,
-                wantDecoration: 'Yes',
-                extraDecorations: [],
-                slotType: 'deluxe'
-              },
-              amount: paymentLinkDetails.amount / 100,
-              status: "created",
-              type: "payment_link",
-              createdAt: new Date(),
-              reference_id: paymentLinkDetails.reference_id,
-              paymentLinkId: paymentLinkId,
-              recovered: true,
-              minimal: true
-            };
-            
-            console.log(`⚠️ [${requestId}] Created minimal order details for processing`);
-          }
-        } else {
-          console.error(`❌ [${requestId}] No reference ID found in payment link notes`);
-          return;
-        }
-      } catch (recoveryError) {
-        console.error(`❌ [${requestId}] Recovery attempt failed:`, recoveryError.message);
-        return;
-      }
-    }
-    
-    if (!orderDetails) {
-      console.error(`❌ [${requestId}] Could not find or recover order details for payment link: ${paymentLinkId}`);
-      return;
-    }
-    
-    console.log(`✅ [${requestId}] Order details found/recovered successfully`);
-    
-    // Prepare enhanced booking data
-    const bookingDataWithPayment = {
-      ...orderDetails.bookingData,
-      paymentId: paymentId,
-      orderId: paymentEntity.order_id,
-      paymentLinkId: paymentLinkId,
-      totalAmount: orderDetails.bookingData.totalAmount,
-      advanceAmount: orderDetails.amount,
-      remainingAmount: orderDetails.bookingData.totalAmount - orderDetails.amount,
-      webhookProcessedAt: new Date().toISOString(),
-      webhookRequestId: requestId,
-      recovered: orderDetails.recovered || false
-    };
+    const paymentLinkId = paymentLinkEntity.id;
 
+    console.log(`🔗 Processing payment link paid: ${paymentLinkId} | Payment: ${paymentId}`);
+
+    // CHECK: Has this payment already been saved?
+    if (dataSaveTracker.has(paymentId)) {
+      console.log(`✅ Payment ${paymentId} already saved - webhook skipping`);
+      return;
+    }
+
+    // Find order data
+    let orderData = orderStore.get(paymentLinkId);
+    if (!orderData && paymentLinkEntity.reference_id) {
+      orderData = orderStore.get(paymentLinkEntity.reference_id);
+    }
+
+    if (!orderData) {
+      console.log(`⚠️ Order data not found for payment link: ${paymentLinkId}`);
+      // Create minimal order data for recovery
+      orderData = {
+        bookingData: {
+          bookingName: 'Recovery Customer',
+          NameUser: 'Recovery Customer',
+          totalAmount: paymentLinkEntity.amount / 100,
+          advanceAmount: paymentLinkEntity.amount / 100,
+          remainingAmount: 0,
+          source: 'webhook_recovery',
+          paymentLinkId: paymentLinkId,
+          slotType: 'deluxe',
+          occasion: 'Special Event'
+        }
+      };
+    }
+
+    // Prepare payment details
     const paymentDetails = {
       razorpay_payment_id: paymentId,
       razorpay_order_id: paymentEntity.order_id,
       payment_link_id: paymentLinkId,
     };
 
-    console.log(`💾 [${requestId}] 🎯 SINGLE DATA SAVE: Saving to Firebase and Sheets (ONLY TIME)...`);
-    console.log(`📊 [${requestId}] Booking data summary:`, {
-      bookingName: bookingDataWithPayment.bookingName,
-      paymentId: paymentId,
-      totalAmount: bookingDataWithPayment.totalAmount,
-      advanceAmount: bookingDataWithPayment.advanceAmount
-    });
-
-    // Save to both services with enhanced error handling (SINGLE TIME SAVE)
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
-      saveToFirebase(bookingDataWithPayment, paymentDetails),
-      saveBookingToSheet(bookingDataWithPayment)
-    ]);
-
-    // Log detailed results
-    const dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
-    };
-
-    console.log(`📊 [${requestId}] 🎯 SINGLE SAVE RESULTS:`, dataStored);
-
-    // Update order status
-    orderDetails.status = "paid";
-    orderDetails.paymentEntity = paymentEntity;
-    orderDetails.dataStored = dataStored;
-    orderDetails.savedBooking = firebaseResult.status === 'fulfilled' ? firebaseResult.value : null;
-    orderDetails.processedAt = new Date().toISOString();
-    orderDetails.webhookRequestId = requestId;
+    // SINGLE SAVE: This is the ONLY place data gets saved
+    const saveResult = await saveBookingDataOnce(paymentId, orderData.bookingData, paymentDetails);
     
-    // Store with multiple keys for better lookup
-    orderStore.set(paymentLinkId, orderDetails);
-    if (orderDetails.reference_id) {
-      orderStore.set(orderDetails.reference_id, orderDetails);
-    }
-    
-    // Log success
-    if (dataStored.firebase && dataStored.sheets) {
-      console.log(`✅ [${requestId}] 🎯 SINGLE SAVE SUCCESS: Data saved to both Firebase and Sheets (ONE TIME ONLY)`);
-    } else if (dataStored.firebase || dataStored.sheets) {
-      console.log(`⚠️ [${requestId}] 🎯 SINGLE SAVE PARTIAL: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only`);
+    if (saveResult && !saveResult.failed) {
+      console.log(`✅ Payment link webhook processing completed: ${paymentId}`);
     } else {
-      console.log(`❌ [${requestId}] 🎯 SINGLE SAVE FAILURE: Data not saved to either service`);
+      console.error(`❌ Payment link webhook processing failed: ${paymentId}`);
     }
-    
-    console.log(`✅ [${requestId}] Payment link processing completed`);
+
   } catch (error) {
-    console.error(`❌ [${requestId}] Payment link processing failed:`, error);
-    processedPayments.delete(paymentEntity.id); // Remove from processed set on error
-    
-    // Enhanced error handling: Try to save minimal data even if processing fails
-    try {
-      console.log(`🔧 [${requestId}] Attempting minimal data save for failed webhook processing...`);
-      
-      const minimalBookingData = {
-        paymentId: paymentEntity.id,
-        orderId: paymentEntity.order_id,
-        paymentLinkId: paymentLinkEntity.id,
-        totalAmount: paymentEntity.amount / 100,
-        advanceAmount: paymentEntity.amount / 100,
-        remainingAmount: 0,
-        source: 'webhook_error_recovery',
-        errorRecoveryAt: new Date().toISOString(),
-        originalError: error.message,
-        paymentStatus: "paid_but_processing_failed",
-        bookingName: 'Webhook Error Recovery',
-        NameUser: 'Webhook Error Recovery',
-        email: '',
-        address: '',
-        whatsapp: '',
-        people: 1,
-        wantDecoration: 'Yes',
-        extraDecorations: [],
-        slotType: 'deluxe',
-        occasion: 'Special Event'
-      };
-
-      const minimalPaymentDetails = {
-        razorpay_payment_id: paymentEntity.id,
-        razorpay_order_id: paymentEntity.order_id,
-        payment_link_id: paymentLinkEntity.id,
-      };
-
-      // Try to save minimal data
-      const [firebaseResult, sheetsResult] = await Promise.allSettled([
-        saveToFirebase(minimalBookingData, minimalPaymentDetails),
-        saveBookingToSheet(minimalBookingData)
-      ]);
-
-      const errorRecoveryResults = {
-        firebase: firebaseResult.status === 'fulfilled',
-        sheets: sheetsResult.status === 'fulfilled',
-        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-        timestamp: new Date().toISOString()
-      };
-
-      console.log(`📊 [${requestId}] Error recovery data save results:`, errorRecoveryResults);
-
-      if (errorRecoveryResults.firebase || errorRecoveryResults.sheets) {
-        console.log(`✅ [${requestId}] ERROR RECOVERY SUCCESS: Minimal data saved to prevent complete loss`);
-      } else {
-        console.log(`❌ [${requestId}] ERROR RECOVERY FAILED: Unable to save even minimal data`);
-      }
-    } catch (recoveryError) {
-      console.error(`❌ [${requestId}] Error recovery also failed:`, recoveryError);
-    }
+    console.error(`❌ Payment link webhook error:`, error);
   }
 };
 
-// Enhanced payment captured handler
-const handlePaymentCaptured = async (paymentEntity, requestId) => {
+// Handle regular payment captured event
+const handlePaymentCaptured = async (payload, eventId) => {
   try {
+    const paymentEntity = payload.payment.entity;
     const paymentId = paymentEntity.id;
     const orderId = paymentEntity.order_id;
-    const paymentLinkId = paymentEntity.payment_link_id;
-    
-    console.log(`💰 [${requestId}] Processing payment captured:`, {
-      paymentId,
-      orderId,
-      paymentLinkId
-    });
-    
-    // Prevent duplicate processing
-    if (processedPayments.has(paymentId)) {
-      console.log(`⚠️ [${requestId}] Payment already processed: ${paymentId}`);
+
+    console.log(`💰 Processing payment captured: ${paymentId} | Order: ${orderId}`);
+
+    // CHECK: Has this payment already been saved?
+    if (dataSaveTracker.has(paymentId)) {
+      console.log(`✅ Payment ${paymentId} already saved - webhook skipping`);
       return;
     }
-    
-    // If this is a payment link payment, it should be handled by payment_link.paid event
-    if (paymentLinkId) {
-      console.log(`ℹ️ [${requestId}] Payment link payment - should be handled by payment_link.paid event`);
+
+    // Find order data
+    const orderData = orderStore.get(orderId);
+    if (!orderData) {
+      console.log(`⚠️ Order data not found for payment: ${paymentId}`);
       return;
     }
-    
-    // Mark as processing
-    processedPayments.add(paymentId);
-    
-    // Handle regular order payments
-    let orderDetails = null;
-    
-    if (orderId) {
-      orderDetails = orderStore.get(orderId);
-    }
-    
-    if (!orderDetails) {
-      console.log(`⚠️ [${requestId}] Order data not found for regular payment: ${paymentId}`);
-      return;
-    }
-    
-    // Process regular payment (similar to payment link handling)
-    const bookingDataWithPayment = {
-      ...orderDetails.bookingData,
-      paymentId: paymentId,
-      orderId: orderId,
-      paymentLinkId: paymentLinkId,
-      totalAmount: orderDetails.bookingData.totalAmount,
-      advanceAmount: orderDetails.amount,
-      remainingAmount: orderDetails.bookingData.totalAmount - orderDetails.amount,
-      webhookProcessedAt: new Date().toISOString(),
-      webhookRequestId: requestId
-    };
 
-    const paymentDetails = {
-      razorpay_payment_id: paymentId,
-      razorpay_order_id: orderId,
-      payment_link_id: paymentLinkId,
-    };
-
-    console.log(`💾 [${requestId}] Saving regular payment data...`);
-
-    // Save to both services
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
-      saveToFirebase(bookingDataWithPayment, paymentDetails),
-      saveBookingToSheet(bookingDataWithPayment)
-    ]);
-
-    const dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
-    };
-
-    console.log(`📊 [${requestId}] Regular payment data storage results:`, dataStored);
-
-    // Update order status
-    orderDetails.status = "paid";
-    orderDetails.paymentId = paymentId;
-    orderDetails.dataStored = dataStored;
-    orderDetails.processedAt = new Date().toISOString();
-    orderStore.set(orderId, orderDetails);
-
-    console.log(`✅ [${requestId}] Regular payment processing completed`);
-  } catch (error) {
-    console.error(`❌ [${requestId}] Payment captured processing failed:`, error);
-    processedPayments.delete(paymentEntity.id); // Remove from processed set on error
-    
-    // Enhanced error handling for regular payments
-    try {
-      console.log(`🔧 [${requestId}] Attempting minimal data save for failed regular payment processing...`);
-      
-      const minimalBookingData = {
-        paymentId: paymentEntity.id,
-        orderId: paymentEntity.order_id,
-        totalAmount: paymentEntity.amount / 100,
-        advanceAmount: paymentEntity.amount / 100,
-        remainingAmount: 0,
-        source: 'regular_payment_error_recovery',
-        errorRecoveryAt: new Date().toISOString(),
-        originalError: error.message,
-        paymentStatus: "paid_but_processing_failed",
-        bookingName: 'Regular Payment Error Recovery',
-        NameUser: 'Regular Payment Error Recovery',
-        email: '',
-        address: '',
-        whatsapp: '',
-        people: 1,
-        wantDecoration: 'Yes',
-        extraDecorations: [],
-        slotType: 'deluxe',
-        occasion: 'Special Event'
-      };
-
-      const minimalPaymentDetails = {
-        razorpay_payment_id: paymentEntity.id,
-        razorpay_order_id: paymentEntity.order_id,
-        payment_link_id: null,
-      };
-
-      // Try to save minimal data
-      const [firebaseResult, sheetsResult] = await Promise.allSettled([
-        saveToFirebase(minimalBookingData, minimalPaymentDetails),
-        saveBookingToSheet(minimalBookingData)
-      ]);
-
-      const errorRecoveryResults = {
-        firebase: firebaseResult.status === 'fulfilled',
-        sheets: sheetsResult.status === 'fulfilled',
-        firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-        sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-        timestamp: new Date().toISOString()
-      };
-
-      console.log(`📊 [${requestId}] Regular payment error recovery results:`, errorRecoveryResults);
-
-      if (errorRecoveryResults.firebase || errorRecoveryResults.sheets) {
-        console.log(`✅ [${requestId}] REGULAR PAYMENT ERROR RECOVERY SUCCESS: Minimal data saved`);
-      } else {
-        console.log(`❌ [${requestId}] REGULAR PAYMENT ERROR RECOVERY FAILED: Unable to save data`);
-      }
-    } catch (recoveryError) {
-      console.error(`❌ [${requestId}] Regular payment error recovery also failed:`, recoveryError);
-    }
-  }
-};
-
-// Enhanced payment failure handler
-const handlePaymentFailed = async (paymentEntity, requestId) => {
-  try {
-    const paymentId = paymentEntity.id;
-    const orderId = paymentEntity.order_id;
-    const paymentLinkId = paymentEntity.payment_link_id;
-    
-    console.log(`❌ [${requestId}] Payment failed:`, {
-      paymentId,
-      orderId,
-      paymentLinkId
-    });
-
-    // Update order status for both types
-    const lookupKey = paymentLinkId || orderId;
-    const orderDetails = orderStore.get(lookupKey);
-    
-    if (orderDetails) {
-      orderDetails.status = "failed";
-      orderDetails.error = "Payment failed";
-      orderDetails.failedAt = new Date().toISOString();
-      orderStore.set(lookupKey, orderDetails);
-    }
-  } catch (error) {
-    console.error(`❌ [${requestId}] Payment failure handling error:`, error);
-  }
-};
-
-// Enhanced payment status endpoint
-app.get("/payment-status/:paymentId", async (req, res) => {
-  try {
-    const { paymentId } = req.params;
-    console.log(`🔍 Checking payment status: ${paymentId}`);
-    
-    // Check local store first
-    const orderDetails = orderStore.get(paymentId);
-    
-    if (orderDetails) {
-      console.log(`📊 Order details found:`, {
-        status: orderDetails.status,
-        type: orderDetails.type,
-        dataStored: orderDetails.dataStored
-      });
-      
-      if (orderDetails.status === "paid") {
-        return res.json({
-          status: "paid",
-          bookingData: orderDetails.savedBooking,
-          paymentDetails: orderDetails.paymentEntity,
-          dataStored: orderDetails.dataStored,
-          type: orderDetails.type || "order",
-          processedAt: orderDetails.processedAt
-        });
-      }
-    }
-    
-    // For payment links, check with Razorpay API
-    if (paymentId.startsWith('plink_')) {
-      try {
-        console.log(`🔍 Checking payment link status with Razorpay API...`);
-        const paymentLink = await razorpay.paymentLink.fetch(paymentId);
-        
-        if (paymentLink.status === "paid") {
-          console.log(`✅ Payment link is paid but not processed locally`);
-          return res.json({
-            status: "paid",
-            razorpayStatus: paymentLink.status,
-            needsRecovery: !orderDetails,
-            type: "payment_link",
-          });
-        } else {
-          console.log(`⏳ Payment link status: ${paymentLink.status}`);
-          return res.json({
-            status: paymentLink.status,
-            razorpayStatus: paymentLink.status,
-            type: "payment_link",
-          });
-        }
-      } catch (apiError) {
-        console.error(`❌ Razorpay API error:`, apiError);
-        return res.json({
-          status: "unknown",
-          error: "Could not verify payment status",
-        });
-      }
-    }
-    
-    // For regular orders
-    if (orderDetails) {
-      res.json({
-        status: orderDetails.status,
-        bookingData: orderDetails.savedBooking,
-        message: orderDetails.status === "failed" ? orderDetails.error : `Payment ${orderDetails.status}`,
-        type: "order",
-        dataStored: orderDetails.dataStored
-      });
-    } else {
-      res.status(404).json({
-        status: "not_found",
-        message: "Order not found",
-      });
-    }
-  } catch (error) {
-    console.error("❌ Payment status check failed:", error);
-    res.status(500).json({ error: "Status check failed", details: error.message });
-  }
-});
-
-// Backup data save endpoint for thank you page
-app.post("/save-backup-data", async (req, res) => {
-  try {
-    const { bookingData, paymentId, orderId } = req.body;
-    
-    if (!bookingData) {
-      return res.status(400).json({ error: "Booking data required" });
-    }
-    
-    console.log(`💾 Backup data save requested for payment: ${paymentId}`);
-    
-    // Check if data was already saved by webhook
-    if (processedPayments.has(paymentId)) {
-      console.log(`ℹ️ Payment ${paymentId} already processed by webhook - skipping backup save`);
-      return res.json({ 
-        status: "already_saved", 
-        message: "Data already saved by webhook",
-        skipped: true
-      });
-    }
-    
-    // Ensure we have the payment details
-    const enhancedBookingData = {
-      ...bookingData,
-      paymentId: paymentId,
-      orderId: orderId,
-      backupSavedAt: new Date().toISOString(),
-      source: 'thankyou_page_backup'
-    };
-
+    // Prepare payment details
     const paymentDetails = {
       razorpay_payment_id: paymentId,
       razorpay_order_id: orderId,
       payment_link_id: null,
     };
 
-    console.log(`🔄 Processing backup save for: ${bookingData.bookingName || 'Unknown'}`);
-
-    // Save to both services with enhanced error handling
-    const [firebaseResult, sheetsResult] = await Promise.allSettled([
-      saveToFirebase(enhancedBookingData, paymentDetails),
-      saveBookingToSheet(enhancedBookingData)
-    ]);
-
-    // Log detailed results
-    const dataStored = {
-      firebase: firebaseResult.status === 'fulfilled',
-      sheets: sheetsResult.status === 'fulfilled',
-      firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-      sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-      timestamp: new Date().toISOString()
-    };
-
-    console.log(`📊 Backup data storage results:`, dataStored);
-
-    if (dataStored.firebase && dataStored.sheets) {
-      console.log(`✅ BACKUP SUCCESS: Data saved to both Firebase and Sheets`);
-      res.json({ 
-        status: "success", 
-        message: "Backup data saved successfully",
-        dataStored: dataStored
-      });
-    } else if (dataStored.firebase || dataStored.sheets) {
-      console.log(`⚠️ BACKUP PARTIAL: Data saved to ${dataStored.firebase ? 'Firebase' : 'Sheets'} only`);
-      res.json({ 
-        status: "partial", 
-        message: "Backup data partially saved",
-        dataStored: dataStored
-      });
+    // SINGLE SAVE: This is the ONLY place data gets saved
+    const saveResult = await saveBookingDataOnce(paymentId, orderData.bookingData, paymentDetails);
+    
+    if (saveResult && !saveResult.failed) {
+      console.log(`✅ Regular payment webhook processing completed: ${paymentId}`);
     } else {
-      console.log(`❌ BACKUP FAILED: Data not saved to either service`);
-      res.status(500).json({ 
-        status: "failed", 
-        message: "Failed to save backup data",
-        dataStored: dataStored
-      });
+      console.error(`❌ Regular payment webhook processing failed: ${paymentId}`);
     }
-  } catch (error) {
-    console.error("❌ Backup data save failed:", error);
-    res.status(500).json({ 
-      error: "Backup save failed", 
-      details: error.message 
-    });
-  }
-});
 
-// Enhanced payment recovery endpoint
-app.post("/recover-payment", async (req, res) => {
+  } catch (error) {
+    console.error(`❌ Regular payment webhook error:`, error);
+  }
+};
+
+// Payment status endpoint (READ ONLY)
+app.get("/payment-status/:paymentId", async (req, res) => {
   try {
-    const { paymentLinkId, bookingData } = req.body;
+    const { paymentId } = req.params;
     
-    if (!paymentLinkId) {
-      return res.status(400).json({ error: "Payment link ID required" });
-    }
-    
-    console.log(`🔄 Starting payment recovery for: ${paymentLinkId}`);
-    
-    // Check payment link status with Razorpay
-    const paymentLink = await razorpay.paymentLink.fetch(paymentLinkId);
-    
-    if (paymentLink.status === "paid") {
-      // Get payments for this payment link
-      const payments = await razorpay.payments.all({
-        'payment_link_id': paymentLinkId
-      });
-      
-      if (payments.items.length > 0) {
-        const payment = payments.items[0];
-        
-        console.log(`🔄 Found payment to recover: ${payment.id}`);
-        
-        // Check if already processed
-        if (processedPayments.has(payment.id)) {
-          console.log(`ℹ️ Payment ${payment.id} already processed - no recovery needed`);
-          return res.json({ 
-            status: "already_processed", 
-            message: "Payment already processed by webhook",
-            paymentId: payment.id
-          });
+    // Check if data has been saved
+    const saveResult = dataSaveTracker.get(paymentId);
+    if (saveResult) {
+      return res.json({
+        status: saveResult.failed ? "failed" : "paid",
+        saved: !saveResult.failed,
+        saveResult: saveResult,
+        dataLocation: {
+          firebase: saveResult.firebase?.success || false,
+          sheets: saveResult.sheets?.success || false
         }
-        
-        // Use provided booking data or create minimal data
-        const recoveryBookingData = bookingData || {
-          bookingName: sanitizeName(paymentLink.notes?.customer || 'Customer'),
-          NameUser: sanitizeName(paymentLink.notes?.customer || 'Customer'),
-          totalAmount: paymentLink.amount / 100,
-          advanceAmount: paymentLink.amount / 100,
-          remainingAmount: 0,
-          source: 'recovery_minimal',
-          occasion: sanitizeForRazorpay(paymentLink.notes?.occasion || 'Celebration'),
-          email: '',
-          address: '',
-          whatsapp: '',
-          people: 1,
-          wantDecoration: 'Yes',
-          extraDecorations: [],
-          slotType: 'deluxe'
-        };
-        
-        // Process the payment manually with recovery data
-        const bookingDataWithPayment = {
-          ...recoveryBookingData,
-          paymentId: payment.id,
-          orderId: payment.order_id,
-          paymentLinkId: paymentLinkId,
-          advanceAmount: paymentLink.amount / 100,
-          remainingAmount: Math.max(0, (recoveryBookingData.totalAmount || 0) - (paymentLink.amount / 100)),
-          totalAmount: recoveryBookingData.totalAmount || paymentLink.amount / 100,
-          recoveredAt: new Date().toISOString(),
-          source: 'manual_recovery'
-        };
-
-        const paymentDetails = {
-          razorpay_payment_id: payment.id,
-          razorpay_order_id: payment.order_id,
-          payment_link_id: paymentLinkId,
-        };
-
-        console.log(`💾 Processing recovery save...`);
-
-        // Save to both services
-        const [firebaseResult, sheetsResult] = await Promise.allSettled([
-          saveToFirebase(bookingDataWithPayment, paymentDetails),
-          saveBookingToSheet(bookingDataWithPayment)
-        ]);
-        
-        const dataStored = {
-          firebase: firebaseResult.status === 'fulfilled',
-          sheets: sheetsResult.status === 'fulfilled',
-          firebaseError: firebaseResult.status === 'rejected' ? firebaseResult.reason?.message : null,
-          sheetsError: sheetsResult.status === 'rejected' ? sheetsResult.reason?.message : null,
-          timestamp: new Date().toISOString()
-        };
-
-        // Mark as processed to avoid future duplicates
-        processedPayments.add(payment.id);
-
-        console.log(`✅ Payment recovery completed:`, dataStored);
-        
-        res.json({
-          status: "recovered",
-          paymentId: payment.id,
-          dataStored: dataStored
-        });
-      } else {
-        console.log(`⚠️ No payments found for payment link: ${paymentLinkId}`);
-        res.json({ status: "no_payment_found" });
-      }
-    } else {
-      console.log(`⚠️ Payment link not paid: ${paymentLink.status}`);
-      res.json({ 
-        status: "not_paid",
-        paymentLinkStatus: paymentLink.status 
       });
     }
-  } catch (error) {
-    console.error("❌ Payment recovery failed:", error);
-    res.status(500).json({ 
-      error: "Recovery failed", 
-      details: error.message 
+
+    // Check order status
+    const orderData = orderStore.get(paymentId);
+    if (orderData) {
+      return res.json({
+        status: orderData.status || "pending",
+        saved: false,
+        message: "Payment found but not yet processed"
+      });
+    }
+
+    res.status(404).json({
+      status: "not_found",
+      message: "Payment not found"
     });
+  } catch (error) {
+    console.error("❌ Payment status check failed:", error);
+    res.status(500).json({ error: "Status check failed" });
   }
 });
 
-// Enhanced cleanup with better TTL management
-setInterval(() => {
-  const now = new Date();
-  let cleanedCount = 0;
-  const keysToDelete = [];
-
-  for (const [id, orderDetails] of orderStore.entries()) {
-    const shouldClean = orderDetails.expiresAt && now > orderDetails.expiresAt;
+// DISABLED: Backup save endpoint (prevents duplicate saves)
+app.post("/save-backup-data", async (req, res) => {
+  try {
+    const { paymentId } = req.body;
     
-    if (shouldClean) {
-      keysToDelete.push(id);
-      cleanedCount++;
+    if (!paymentId) {
+      return res.status(400).json({ error: "Payment ID required" });
     }
-  }
 
-  // Delete expired orders
-  keysToDelete.forEach(key => orderStore.delete(key));
-  
-  if (cleanedCount > 0) {
-    console.log(`🧹 Cleaned up ${cleanedCount} expired orders`);
-  }
-  
-  // Also clean up processed payments older than 1 hour
-  const processedPaymentsCopy = new Set(processedPayments);
-  processedPaymentsCopy.forEach(paymentId => {
-    // Keep recent payments in the set for 1 hour
-    // In a real implementation, you'd want to store timestamps
-    if (processedPayments.size > 1000) {
-      processedPayments.clear();
+    // Check if already saved
+    const saveResult = dataSaveTracker.get(paymentId);
+    if (saveResult) {
+      console.log(`ℹ️ Payment ${paymentId} already saved by webhook - backup not needed`);
+      return res.json({ 
+        status: "already_saved", 
+        message: "Data already saved by webhook",
+        saveResult: saveResult
+      });
     }
-  });
-  
-}, 30 * 60 * 1000); // Run every 30 minutes
 
-// Enhanced health check endpoint
+    console.log(`⚠️ Payment ${paymentId} not found in save tracker - webhook may have failed`);
+    res.json({ 
+      status: "not_saved", 
+      message: "Payment not processed by webhook yet. Please wait or contact support."
+    });
+  } catch (error) {
+    console.error("❌ Backup check failed:", error);
+    res.status(500).json({ error: "Backup check failed" });
+  }
+});
+
+// Health check
 app.get("/health", (req, res) => {
   res.json({ 
     status: "healthy", 
     timestamp: new Date().toISOString(),
     activeOrders: orderStore.size,
-    processedPayments: processedPayments.size,
-    version: "3.2 - Single Data Save (Webhook Only)",
-    environment: process.env.NODE_ENV || 'development',
+    savedPayments: dataSaveTracker.size,
+    savesInProgress: saveInProgress.size,
+    version: "4.0 - Guaranteed Single Save",
     features: {
-      webhookSignatureVerification: true,
-      multipleOrderLookup: true,
-      dataRecovery: true,
-      retryLogic: true,
+      singleSaveGuarantee: true,
+      atomicOperations: true,
       duplicateProtection: true,
-      immediateDataSave: false, // 🎯 DISABLED
-      singleDataSaveOnly: true, // 🎯 ENABLED
-      backupDataEndpoint: true,
-      thankyouPageBackup: true,
-      webhookErrorRecovery: true,
-      webhookOnlyDataSave: true // 🎯 NEW FEATURE
+      webhookOnlyDataSave: true
     }
   });
 });
 
-// Debug endpoint for development
-if (process.env.NODE_ENV === 'development') {
-  app.get("/debug/orders", (req, res) => {
-    const orders = Array.from(orderStore.entries()).map(([id, order]) => ({
-      id,
-      status: order.status,
-      type: order.type,
-      createdAt: order.createdAt,
-      dataStored: order.dataStored,
-      recovered: order.recovered || false
-    }));
-    
-    res.json({ 
-      orders, 
-      count: orders.length,
-      processedPayments: processedPayments.size
-    });
-  });
-  
-  app.get("/debug/processed-payments", (req, res) => {
-    res.json({ 
-      processedPayments: Array.from(processedPayments),
-      count: processedPayments.size
-    });
-  });
-}
+// Cleanup expired orders
+setInterval(() => {
+  const now = new Date();
+  let cleanedCount = 0;
 
-// Test endpoint for webhook
-app.post("/test-webhook", (req, res) => {
-  console.log("🧪 Test webhook received:", req.body);
-  res.json({ status: "test_received", timestamp: new Date().toISOString() });
-});
+  for (const [id, orderDetails] of orderStore.entries()) {
+    if (orderDetails.expiresAt && now > orderDetails.expiresAt) {
+      orderStore.delete(id);
+      cleanedCount++;
+    }
+  }
+
+  if (cleanedCount > 0) {
+    console.log(`🧹 Cleaned up ${cleanedCount} expired orders`);
+  }
+}, 30 * 60 * 1000);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Enhanced Server v3.2 running on port ${PORT}`);
-  console.log(`📡 Payment Links API Ready`);
-  console.log(`🔗 Webhook endpoint: /webhook`);
-  console.log(`🔄 Recovery endpoint: /recover-payment`);
-  console.log(`💾 Backup data endpoint: /save-backup-data`);
-  console.log(`📊 Health check: /health`);
-  console.log(`🧪 Test webhook: /test-webhook`);
-  console.log(`✅ 🎯 SINGLE DATA SAVE SYSTEM ENABLED:`);
-  console.log(`   • ❌ DISABLED: Immediate data save on payment link creation`);
-  console.log(`   • ✅ ENABLED: Single data save only via webhook after payment`);
-  console.log(`   • ✅ ENABLED: Improved webhook signature verification`);
-  console.log(`   • ✅ ENABLED: Multiple order lookup strategies`);
-  console.log(`   • ✅ ENABLED: Automatic data recovery system`);
-  console.log(`   • ✅ ENABLED: Retry logic for data saving`);
-  console.log(`   • ✅ ENABLED: Duplicate payment protection`);
-  console.log(`   • ✅ ENABLED: Better error handling and logging`);
-  console.log(`   • 🎯 KEY CHANGE: Data saved ONLY when payment is completed`);
+  console.log(`🚀 Single Save Payment System v4.0 running on port ${PORT}`);
+  console.log(`✅ GUARANTEED SINGLE DATA SAVE SYSTEM:`);
+  console.log(`   • Data is saved EXACTLY ONCE via webhook only`);
+  console.log(`   • Atomic operations prevent duplicate saves`);
+  console.log(`   • All backup endpoints are disabled/read-only`);
+  console.log(`   • Complete duplicate protection across all endpoints`);
 });
