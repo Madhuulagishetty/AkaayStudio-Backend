@@ -126,7 +126,7 @@ const saveBookingToSheet = async (bookingData, retryCount = 0) => {
     });
 
     const response = await axios.post(
-      "https://sheetdb.io/api/v1/s6a0t5omac7jg",
+      "https://sheetdb.io/api/v1/ze8obcwccch0z",
       {
         data: [sheetData],
       },
