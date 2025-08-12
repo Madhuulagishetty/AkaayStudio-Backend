@@ -30,7 +30,7 @@ if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
 }
 
 if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
-  console.error("❌ Missing Razorpay webhook secret in environment variables");
+  console.error("❌ Missing Razorpay webhook secret in environment variabless");
   process.exit(1);
 }
 
